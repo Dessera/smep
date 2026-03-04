@@ -16,3 +16,6 @@ result-*
 # Zed config files
 /.zed
 /.ropeproject
+
+# Data files
+/.data
