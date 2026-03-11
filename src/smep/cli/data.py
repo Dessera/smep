@@ -1,7 +1,7 @@
 """Data fetching and processing CLI commands."""
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import typer
 import logging
 
@@ -147,12 +147,23 @@ def process(
         "-o",
         help="Output directory for processed data. Defaults to source directory + '_processed'.",
     ),
+    agg_stats: Optional[List[str]] = typer.Option(
+        None,
+        "--agg-stats",
+        help=(
+            "Aggregation statistics for temporal features. "
+            "Valid values: mean, max, min, std. "
+            "Can be specified multiple times (e.g. --agg-stats mean --agg-stats std). "
+            "Defaults to 'mean'."
+        ),
+    ),
 ) -> None:
     """Process data using a specified processor.
 
     Example:
         smep data process mimic3 .data/mimic-iii-clinical-database-demo-1.4
         smep data process mimic3 .data/mimic-iii --output .data/processed
+        smep data process mimic3 .data/mimic-iii --agg-stats mean --agg-stats std
     """
     try:
         # Resolve source path
@@ -164,12 +175,17 @@ def process(
         else:
             output = output.resolve()
 
+        # Resolve agg_stats: default to ["mean"] if not specified
+        resolved_agg_stats = agg_stats if agg_stats else ["mean"]
+
         # Get the processor from registry
         registry = get_processor_registry()
 
         try:
-            processor = registry.get_processor(name)
-        except KeyError as e:
+            processor = registry.get_processor(
+                name, agg_stats=resolved_agg_stats
+            )
+        except (KeyError, ValueError) as e:
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)
 
@@ -177,6 +193,7 @@ def process(
         typer.echo(f"Processing data with {name} processor...")
         typer.echo(f"Source directory: {source}")
         typer.echo(f"Output directory: {output}")
+        typer.echo(f"Aggregation statistics: {', '.join(resolved_agg_stats)}")
 
         try:
             processor.process(source, output)

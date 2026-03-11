@@ -27,8 +27,28 @@ class MIMIC3Processor(DataProcessor):
     # Time window for temporal features (hours)
     TIME_WINDOW_HOURS = 24
 
-    def __init__(self):
-        """Initialize the MIMIC3 processor."""
+    # Available aggregation statistics
+    VALID_AGG_STATS = {"mean", "max", "min", "std"}
+
+    def __init__(self, agg_stats: list[str] | None = None):
+        """Initialize the MIMIC3 processor.
+
+        Args:
+            agg_stats: List of aggregation statistics to compute for temporal
+                features. Valid values: 'mean', 'max', 'min', 'std'.
+                Defaults to all four statistics if None.
+        """
+        if agg_stats is None:
+            self.agg_stats = ["mean", "max", "min", "std"]
+        else:
+            invalid = set(agg_stats) - self.VALID_AGG_STATS
+            if invalid:
+                raise ValueError(
+                    f"Invalid aggregation statistics: {invalid}. "
+                    f"Valid options are: {self.VALID_AGG_STATS}"
+                )
+            self.agg_stats = list(agg_stats)
+
         self.cohort_df = None
         self.labels_df = None
         self.static_features = None
@@ -239,20 +259,12 @@ class MIMIC3Processor(DataProcessor):
                 for vital_name, item_ids in vital_items.items():
                     vital_data = chunk[chunk["itemid"].isin(item_ids)]
                     if not vital_data.empty:
-                        # Aggregate: mean, max, min, std
+                        # Aggregate: selected statistics
                         agg = vital_data.groupby(["subject_id", "hadm_id"])[
                             "valuenum"
-                        ].agg(
-                            [
-                                ("mean", "mean"),
-                                ("max", "max"),
-                                ("min", "min"),
-                                ("std", "std"),
-                            ]
-                        )
+                        ].agg([(stat, stat) for stat in self.agg_stats])
                         agg.columns = [
-                            f"{vital_name}_{stat}"
-                            for stat in ["mean", "max", "min", "std"]
+                            f"{vital_name}_{stat}" for stat in self.agg_stats
                         ]
                         aggregated_features.append(agg)
         except Exception as e:
@@ -312,17 +324,9 @@ class MIMIC3Processor(DataProcessor):
                     if not lab_data.empty:
                         agg = lab_data.groupby(["subject_id", "hadm_id"])[
                             "valuenum"
-                        ].agg(
-                            [
-                                ("mean", "mean"),
-                                ("max", "max"),
-                                ("min", "min"),
-                                ("std", "std"),
-                            ]
-                        )
+                        ].agg([(stat, stat) for stat in self.agg_stats])
                         agg.columns = [
-                            f"{lab_name}_{stat}"
-                            for stat in ["mean", "max", "min", "std"]
+                            f"{lab_name}_{stat}" for stat in self.agg_stats
                         ]
                         aggregated_features.append(agg)
         except Exception as e:

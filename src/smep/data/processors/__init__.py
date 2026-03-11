@@ -52,11 +52,12 @@ class DataProcessorRegistry:
         }
         logger.debug(f"Registered processor: {name}")
 
-    def get_processor(self, name: str) -> DataProcessor:
+    def get_processor(self, name: str, **kwargs: Any) -> DataProcessor:
         """Get a processor instance by name.
 
         Args:
             name: The name of the processor to retrieve.
+            **kwargs: Additional keyword arguments passed to the processor constructor.
 
         Returns:
             An instance of the requested DataProcessor.
@@ -71,7 +72,7 @@ class DataProcessorRegistry:
             )
 
         processor_class = self._registry[name]["processor_class"]
-        return processor_class()
+        return processor_class(**kwargs)
 
     def list_processors(self) -> List[str]:
         """List all available processor names.
