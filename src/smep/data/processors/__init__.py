@@ -9,7 +9,7 @@ from .mimic import MIMIC3Processor
 logger = logging.getLogger(__name__)
 
 
-class ProcessorRegistry:
+class DataProcessorRegistry:
     """Registry for managing data processors.
 
     This class maintains a registry of available data processors with their
@@ -112,14 +112,14 @@ class ProcessorRegistry:
 
 
 # Global processor registry instance
-_global_processor_registry = ProcessorRegistry()
+_global_processor_registry = DataProcessorRegistry()
 
 
-def get_processor_registry() -> ProcessorRegistry:
+def get_processor_registry() -> DataProcessorRegistry:
     """Get the global data processor registry.
 
     Returns:
-        The global ProcessorRegistry instance.
+        The global DataProcessorRegistry instance.
     """
     return _global_processor_registry
 
@@ -127,6 +127,6 @@ def get_processor_registry() -> ProcessorRegistry:
 __all__ = [
     "DataProcessor",
     "MIMIC3Processor",
-    "ProcessorRegistry",
+    "DataProcessorRegistry",
     "get_processor_registry",
 ]

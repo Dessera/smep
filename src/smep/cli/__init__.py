@@ -3,6 +3,7 @@ import sys
 import typer
 
 from . import data as data_cli
+from . import model as model_cli
 
 # Configure logging to output to stderr
 logging.basicConfig(
@@ -15,3 +16,6 @@ app = typer.Typer(no_args_is_help=True)
 
 # Add data sub-command group
 app.add_typer(data_cli.app, name="data")
+
+# Add model sub-command group
+app.add_typer(model_cli.app, name="model")

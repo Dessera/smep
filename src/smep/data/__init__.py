@@ -14,7 +14,7 @@ from .fetchers import (
 from .processors import (
     DataProcessor,
     MIMIC3Processor,
-    ProcessorRegistry,
+    DataProcessorRegistry,
     get_processor_registry,
 )
 
@@ -29,6 +29,6 @@ __all__ = [
     # Processors
     "DataProcessor",
     "MIMIC3Processor",
-    "ProcessorRegistry",
+    "DataProcessorRegistry",
     "get_processor_registry",
 ]
