@@ -157,6 +157,26 @@ def process(
             "Defaults to 'mean'."
         ),
     ),
+    test_size: float = typer.Option(
+        0.2,
+        "--test-size",
+        help="Fraction of samples reserved for the test split.",
+    ),
+    random_state: int = typer.Option(
+        42,
+        "--random-state",
+        help="Random seed used for reproducible dataset splitting.",
+    ),
+    stratify: bool = typer.Option(
+        True,
+        "--stratify/--no-stratify",
+        help="Use label-stratified train/test splitting.",
+    ),
+    split_enabled: bool = typer.Option(
+        True,
+        "--split/--no-split",
+        help="Generate train/test split files alongside the full dataset.",
+    ),
 ) -> None:
     """Process data using a specified processor.
 
@@ -164,6 +184,7 @@ def process(
         smep data process mimic3 .data/mimic-iii-clinical-database-demo-1.4
         smep data process mimic3 .data/mimic-iii --output .data/processed
         smep data process mimic3 .data/mimic-iii --agg-stats mean --agg-stats std
+        smep data process mimic3 .data/mimic-iii --test-size 0.25 --random-state 7
     """
     try:
         # Resolve source path
@@ -183,7 +204,12 @@ def process(
 
         try:
             processor = registry.get_processor(
-                name, agg_stats=resolved_agg_stats
+                name,
+                agg_stats=resolved_agg_stats,
+                test_size=test_size,
+                random_state=random_state,
+                stratify=stratify,
+                split_enabled=split_enabled,
             )
         except (KeyError, ValueError) as e:
             typer.echo(f"Error: {e}", err=True)
@@ -194,6 +220,11 @@ def process(
         typer.echo(f"Source directory: {source}")
         typer.echo(f"Output directory: {output}")
         typer.echo(f"Aggregation statistics: {', '.join(resolved_agg_stats)}")
+        typer.echo(f"Train/test split enabled: {split_enabled}")
+        if split_enabled:
+            typer.echo(f"Test split ratio: {test_size}")
+            typer.echo(f"Random seed: {random_state}")
+            typer.echo(f"Stratified split: {stratify}")
 
         try:
             processor.process(source, output)

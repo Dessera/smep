@@ -19,3 +19,6 @@ result-*
 
 # Data files
 /.data
+
+# Agent helper files
+/.agent

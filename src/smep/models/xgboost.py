@@ -4,6 +4,7 @@ Binary classification task for in-hospital mortality prediction on MIMIC-III sep
 Data format:
   - X.csv: Feature matrix (n_samples x n_features)
   - y.csv: Label column (hospital_expire_flag, 0/1)
+    - X_train.csv / y_train.csv: Optional training split files
   - feature_names.txt: Feature name list (one per line)
   - metadata.json: Dataset metadata
 """
@@ -11,7 +12,7 @@ Data format:
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import joblib
 import numpy as np
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 # Data file name constants
 _X_FILE = "X.csv"
 _Y_FILE = "y.csv"
+_X_TRAIN_FILE = "X_train.csv"
+_Y_TRAIN_FILE = "y_train.csv"
 _FEATURE_NAMES_FILE = "feature_names.txt"
 _METADATA_FILE = "metadata.json"
 
@@ -52,8 +55,12 @@ class XGBoostModel(Model):
         """Initialize XGBoostModel."""
         self._classifier: Optional[XGBClassifier] = None
         self._feature_names: list[str] = []
-        self._metadata: dict = {}
+        self._metadata: dict[str, Any] = {}
         self._is_trained: bool = False
+        self._training_data_files: dict[str, str] = {
+            "X": _X_FILE,
+            "y": _Y_FILE,
+        }
 
     # ------------------------------------------------------------------
     # Public interface
@@ -63,8 +70,9 @@ class XGBoostModel(Model):
         """Load processed data from source_path and train the XGBoost model.
 
         Training pipeline:
-        1. Load X.csv / y.csv / feature_names.txt / metadata.json
-        2. Train the model on the full dataset
+        1. Prefer X_train.csv / y_train.csv when available
+        2. Fall back to X.csv / y.csv for backward compatibility
+        3. Train the model on the selected training dataset
 
         Args:
             source_path: Path to the processed data directory.
@@ -77,9 +85,10 @@ class XGBoostModel(Model):
         source_path = Path(source_path)
         logger.info(f"Loading data from {source_path}...")
 
-        X, y = self._load_data(source_path)
+        X, y = self._load_training_data(source_path)
         self._feature_names = self._load_feature_names(source_path)
         self._metadata = self._load_metadata(source_path)
+        self._metadata["training_data_files"] = self._training_data_files.copy()
 
         logger.info(
             f"Data loaded: {X.shape[0]} samples, {X.shape[1]} features, "
@@ -105,8 +114,12 @@ class XGBoostModel(Model):
             n_jobs=-1,
         )
 
-        # Train model on full dataset
-        logger.info("Training model on full dataset...")
+        # Train model on the selected training dataset
+        logger.info(
+            "Training model using %s and %s...",
+            self._training_data_files["X"],
+            self._training_data_files["y"],
+        )
         self._classifier.fit(X, y)
         self._is_trained = True
         logger.info("Training complete.")
@@ -130,6 +143,8 @@ class XGBoostModel(Model):
             raise RuntimeError(
                 "Model has not been trained. Call train() first."
             )
+        if self._classifier is None:
+            raise RuntimeError("Classifier is unavailable after training")
 
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -233,6 +248,36 @@ class XGBoostModel(Model):
     # Private helper methods
     # ------------------------------------------------------------------
 
+    def _load_training_data(
+        self, source_path: Path
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Load preferred training data, using split files when present."""
+        train_x_file = source_path / _X_TRAIN_FILE
+        train_y_file = source_path / _Y_TRAIN_FILE
+
+        if train_x_file.exists() and train_y_file.exists():
+            self._training_data_files = {
+                "X": _X_TRAIN_FILE,
+                "y": _Y_TRAIN_FILE,
+            }
+            logger.info(
+                "Detected processed train split files; using %s and %s",
+                train_x_file.name,
+                train_y_file.name,
+            )
+            return self._load_data_files(train_x_file, train_y_file)
+
+        self._training_data_files = {
+            "X": _X_FILE,
+            "y": _Y_FILE,
+        }
+        logger.info(
+            "Train split files not found; falling back to %s and %s",
+            _X_FILE,
+            _Y_FILE,
+        )
+        return self._load_data(source_path)
+
     def _load_data(self, source_path: Path) -> tuple[np.ndarray, np.ndarray]:
         """Load feature matrix and label vector.
 
@@ -248,6 +293,13 @@ class XGBoostModel(Model):
         """
         x_file = source_path / _X_FILE
         y_file = source_path / _Y_FILE
+
+        return self._load_data_files(x_file, y_file)
+
+    def _load_data_files(
+        self, x_file: Path, y_file: Path
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Load feature matrix and label vector from explicit file paths."""
 
         if not x_file.exists():
             raise FileNotFoundError(f"Feature file not found: {x_file}")
@@ -267,8 +319,8 @@ class XGBoostModel(Model):
 
         # Use the first column as the label
         y_col = y_df.columns[0]
-        X = X_df.values.astype(np.float32)
-        y = y_df[y_col].values.astype(np.int32)
+        X = X_df.to_numpy(dtype=np.float32)
+        y = y_df[y_col].to_numpy(dtype=np.int32)
 
         return X, y
 
@@ -295,7 +347,7 @@ class XGBoostModel(Model):
         ]
         return names
 
-    def _load_metadata(self, source_path: Path) -> dict:
+    def _load_metadata(self, source_path: Path) -> dict[str, Any]:
         """Load dataset metadata.
 
         Args:

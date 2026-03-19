@@ -4,8 +4,10 @@ from pathlib import Path
 import json
 import logging
 from datetime import datetime
+from typing import Any, cast
 import pandas as pd
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from .processor import DataProcessor
@@ -30,13 +32,24 @@ class MIMIC3Processor(DataProcessor):
     # Available aggregation statistics
     VALID_AGG_STATS = {"mean", "max", "min", "std"}
 
-    def __init__(self, agg_stats: list[str] | None = None):
+    def __init__(
+        self,
+        agg_stats: list[str] | None = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        stratify: bool = True,
+        split_enabled: bool = True,
+    ):
         """Initialize the MIMIC3 processor.
 
         Args:
             agg_stats: List of aggregation statistics to compute for temporal
                 features. Valid values: 'mean', 'max', 'min', 'std'.
                 Defaults to all four statistics if None.
+            test_size: Fraction of samples reserved for the test split.
+            random_state: Random seed used for reproducible splitting.
+            stratify: Whether train/test split should be label-stratified.
+            split_enabled: Whether to write train/test split files.
         """
         if agg_stats is None:
             self.agg_stats = ["mean", "max", "min", "std"]
@@ -49,11 +62,25 @@ class MIMIC3Processor(DataProcessor):
                 )
             self.agg_stats = list(agg_stats)
 
-        self.cohort_df = None
-        self.labels_df = None
-        self.static_features = None
-        self.temporal_features = None
-        self.final_df = None
+        if not 0 < test_size < 1:
+            raise ValueError("test_size must be between 0 and 1")
+
+        self.test_size = test_size
+        self.random_state = random_state
+        self.stratify = stratify
+        self.split_enabled = split_enabled
+
+        self.cohort_df: pd.DataFrame | None = None
+        self.labels_df: pd.DataFrame | None = None
+        self.static_features: pd.DataFrame | None = None
+        self.temporal_features: pd.DataFrame | None = None
+        self.full_df: pd.DataFrame | None = None
+        self.train_df: pd.DataFrame | None = None
+        self.test_df: pd.DataFrame | None = None
+        self.final_df: pd.DataFrame | None = None
+        self.split_metadata: dict[str, object] = {}
+        self.preprocessing_metadata: dict[str, object] = {}
+        self.sample_filtering_metadata: dict[str, object] = {}
 
     def process(self, source_path: Path, target_path: Path) -> None:
         """Process MIMIC-III data and generate ML-ready dataset.
@@ -112,9 +139,10 @@ class MIMIC3Processor(DataProcessor):
         """Extract mortality labels."""
         admissions_path = source_path / "ADMISSIONS.csv"
         admissions_df = pd.read_csv(admissions_path)
+        cohort_df = self._require_frame(self.cohort_df, "cohort_df")
 
         # Merge with cohort to get labels
-        self.labels_df = self.cohort_df.merge(
+        self.labels_df = cohort_df.merge(
             admissions_df[["subject_id", "hadm_id", "hospital_expire_flag"]],
             on=["subject_id", "hadm_id"],
             how="left",
@@ -133,7 +161,7 @@ class MIMIC3Processor(DataProcessor):
         admissions_df = pd.read_csv(admissions_path)
 
         # Merge with cohort
-        static_df = self.cohort_df.copy()
+        static_df = self._require_frame(self.cohort_df, "cohort_df").copy()
 
         # Add patient demographics
         static_df = static_df.merge(
@@ -194,7 +222,7 @@ class MIMIC3Processor(DataProcessor):
         icustays_df["outtime"] = pd.to_datetime(icustays_df["outtime"])
 
         # Merge with cohort
-        icu_cohort = self.cohort_df.merge(
+        icu_cohort = self._require_frame(self.cohort_df, "cohort_df").merge(
             icustays_df[["subject_id", "hadm_id", "icustay_id", "intime"]],
             on=["subject_id", "hadm_id"],
             how="left",
@@ -231,8 +259,9 @@ class MIMIC3Processor(DataProcessor):
             "SpO2": [646, 220277],  # Oxygen Saturation
         }
 
-        # Read chart events in chunks to handle large file
-        aggregated_features = []
+        # Collect all cohort rows from all chunks before aggregating to avoid
+        # duplicate columns caused by per-chunk partial aggregations.
+        raw_rows: list[pd.DataFrame] = []
 
         try:
             for chunk in pd.read_csv(chartevents_path, chunksize=100000):
@@ -244,8 +273,6 @@ class MIMIC3Processor(DataProcessor):
                     on=["subject_id", "hadm_id"],
                     how="inner",
                 )
-
-                # Filter for first 24 hours after ICU admission
                 chunk = chunk[
                     (chunk["charttime"] >= chunk["intime"])
                     & (
@@ -254,23 +281,30 @@ class MIMIC3Processor(DataProcessor):
                         + pd.Timedelta(hours=self.TIME_WINDOW_HOURS)
                     )
                 ]
-
-                # Extract vital signs
-                for vital_name, item_ids in vital_items.items():
-                    vital_data = chunk[chunk["itemid"].isin(item_ids)]
-                    if not vital_data.empty:
-                        # Aggregate: selected statistics
-                        agg = vital_data.groupby(["subject_id", "hadm_id"])[
-                            "valuenum"
-                        ].agg([(stat, stat) for stat in self.agg_stats])
-                        agg.columns = [
-                            f"{vital_name}_{stat}" for stat in self.agg_stats
-                        ]
-                        aggregated_features.append(agg)
+                if not chunk.empty:
+                    raw_rows.append(
+                        chunk[["subject_id", "hadm_id", "itemid", "valuenum"]]
+                    )
         except Exception as e:
             logger.warning(
                 f"Error processing CHARTEVENTS: {e}. Using empty features."
             )
+
+        if not raw_rows:
+            return icu_cohort[["subject_id", "hadm_id"]].copy()
+
+        all_data = pd.concat(raw_rows, axis=0)
+        aggregated_features: list[pd.DataFrame] = []
+        for vital_name, item_ids in vital_items.items():
+            vital_data = all_data[all_data["itemid"].isin(item_ids)]
+            if not vital_data.empty:
+                agg = vital_data.groupby(["subject_id", "hadm_id"])[
+                    "valuenum"
+                ].agg([(stat, stat) for stat in self.agg_stats])
+                agg.columns = [
+                    f"{vital_name}_{stat}" for stat in self.agg_stats
+                ]
+                aggregated_features.append(agg)
 
         if aggregated_features:
             result = pd.concat(aggregated_features, axis=1).reset_index()
@@ -296,7 +330,7 @@ class MIMIC3Processor(DataProcessor):
             "Chloride": [50806, 50902],
         }
 
-        aggregated_features = []
+        raw_rows: list[pd.DataFrame] = []
 
         try:
             for chunk in pd.read_csv(labevents_path, chunksize=100000):
@@ -308,7 +342,6 @@ class MIMIC3Processor(DataProcessor):
                     on=["subject_id", "hadm_id"],
                     how="inner",
                 )
-
                 chunk = chunk[
                     (chunk["charttime"] >= chunk["intime"])
                     & (
@@ -317,22 +350,28 @@ class MIMIC3Processor(DataProcessor):
                         + pd.Timedelta(hours=self.TIME_WINDOW_HOURS)
                     )
                 ]
-
-                # Extract lab values
-                for lab_name, item_ids in lab_items.items():
-                    lab_data = chunk[chunk["itemid"].isin(item_ids)]
-                    if not lab_data.empty:
-                        agg = lab_data.groupby(["subject_id", "hadm_id"])[
-                            "valuenum"
-                        ].agg([(stat, stat) for stat in self.agg_stats])
-                        agg.columns = [
-                            f"{lab_name}_{stat}" for stat in self.agg_stats
-                        ]
-                        aggregated_features.append(agg)
+                if not chunk.empty:
+                    raw_rows.append(
+                        chunk[["subject_id", "hadm_id", "itemid", "valuenum"]]
+                    )
         except Exception as e:
             logger.warning(
                 f"Error processing LABEVENTS: {e}. Using empty features."
             )
+
+        if not raw_rows:
+            return icu_cohort[["subject_id", "hadm_id"]].copy()
+
+        all_data = pd.concat(raw_rows, axis=0)
+        aggregated_features: list[pd.DataFrame] = []
+        for lab_name, item_ids in lab_items.items():
+            lab_data = all_data[all_data["itemid"].isin(item_ids)]
+            if not lab_data.empty:
+                agg = lab_data.groupby(["subject_id", "hadm_id"])[
+                    "valuenum"
+                ].agg([(stat, stat) for stat in self.agg_stats])
+                agg.columns = [f"{lab_name}_{stat}" for stat in self.agg_stats]
+                aggregated_features.append(agg)
 
         if aggregated_features:
             result = pd.concat(aggregated_features, axis=1).reset_index()
@@ -343,103 +382,296 @@ class MIMIC3Processor(DataProcessor):
 
     def _clean_and_aggregate(self) -> None:
         """Clean data and merge all features."""
-        # Merge all features
-        self.final_df = self.labels_df.merge(
-            self.static_features, on=["subject_id", "hadm_id"], how="left"
-        ).merge(
-            self.temporal_features, on=["subject_id", "hadm_id"], how="left"
-        )
+        merged_df = self._build_merged_dataset()
+        filtered_df = self._filter_sparse_samples(merged_df)
 
-        logger.info(f"Merged data shape: {self.final_df.shape}")
+        if filtered_df.empty:
+            raise ValueError("No samples remaining after sample filtering")
 
-        # Separate features and labels
-        y = self.final_df["hospital_expire_flag"]
-        X = self.final_df.drop(
-            columns=["subject_id", "hadm_id", "hospital_expire_flag"]
-        )
-
-        logger.info(f"Initial features: {X.shape[1]}, samples: {X.shape[0]}")
-
-        # Remove samples with >90% missing values
-        if len(X.columns) > 0:
-            missing_ratio = X.isna().sum(axis=1) / len(X.columns)
-            valid_samples = missing_ratio <= 0.9
-            removed_samples = (~valid_samples).sum()
-
-            X = X[valid_samples]
-            y = y[valid_samples]
-
-            logger.info(
-                f"Removed {removed_samples} samples with >90% missing values"
+        if self.split_enabled:
+            train_df, test_df = self._split_dataset(filtered_df)
+            processed_train_df, processed_test_df = self._preprocess_datasets(
+                train_df, test_df
             )
+            full_df = pd.concat(
+                [processed_train_df, processed_test_df], axis=0
+            ).sort_index()
         else:
-            logger.warning("No features found after initial filtering")
-            return
+            processed_train_df, processed_test_df = self._preprocess_datasets(
+                filtered_df, None
+            )
+            full_df = processed_train_df.copy()
 
-        # Remove features with >95% missing values
-        missing_ratio_features = X.isna().sum() / len(X)
-        valid_features = missing_ratio_features <= 0.95
-        removed_feature_count = (~valid_features).sum()
+        self.train_df = processed_train_df
+        self.test_df = processed_test_df
+        self.full_df = full_df
+        self.final_df = full_df
 
-        X = X.loc[:, valid_features]
+    def _build_merged_dataset(self) -> pd.DataFrame:
+        """Build the merged sample table before filtering and preprocessing."""
+        labels_df = self._require_frame(self.labels_df, "labels_df")
+        static_features = self._require_frame(
+            self.static_features, "static_features"
+        )
+        temporal_features = self._require_frame(
+            self.temporal_features, "temporal_features"
+        )
+
+        merged_df = labels_df.merge(
+            static_features, on=["subject_id", "hadm_id"], how="left"
+        ).merge(temporal_features, on=["subject_id", "hadm_id"], how="left")
+
+        logger.info(f"Merged data shape: {merged_df.shape}")
+        return merged_df
+
+    def _filter_sparse_samples(self, merged_df: pd.DataFrame) -> pd.DataFrame:
+        """Remove samples whose feature vectors are mostly missing."""
+        feature_columns = self._get_feature_columns(merged_df)
+        if not feature_columns:
+            logger.warning("No features found after initial merge")
+            raise ValueError("No features found after initial merge")
+
+        feature_df = merged_df[feature_columns]
+        logger.info(
+            "Initial features: %s, samples: %s",
+            feature_df.shape[1],
+            feature_df.shape[0],
+        )
+
+        missing_ratio = feature_df.isna().sum(axis=1) / len(feature_columns)
+        valid_samples = missing_ratio <= 0.9
+        removed_samples = int((~valid_samples).sum())
+        filtered_df = merged_df.loc[valid_samples].copy()
 
         logger.info(
-            f"Removed {removed_feature_count} features with >95% missing values"
+            "Removed %s samples with >90%% missing values", removed_samples
         )
-        logger.info(f"Final shape before imputation: {X.shape}")
 
-        # Check if we have data remaining
-        if X.empty or X.shape[1] == 0:
-            logger.error("No features remaining after filtering")
+        self.sample_filtering_metadata = {
+            "removed_samples": removed_samples,
+            "remaining_samples": len(filtered_df),
+            "threshold": 0.9,
+        }
+        return filtered_df
+
+    def _split_dataset(
+        self, filtered_df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Split the filtered dataset into train and test partitions."""
+        if len(filtered_df) < 2:
+            raise ValueError(
+                "At least 2 samples are required to create a train/test split"
+            )
+
+        label_series = filtered_df["hospital_expire_flag"]
+        stratify_labels = None
+        if self.stratify:
+            class_counts = label_series.value_counts(dropna=False)
+            if len(class_counts) < 2:
+                raise ValueError(
+                    "Stratified split requires at least 2 label classes"
+                )
+            if int(class_counts.min()) < 2:
+                raise ValueError(
+                    "Stratified split requires at least 2 samples in each label class"
+                )
+            stratify_labels = label_series
+
+        try:
+            split_frames = cast(
+                list[pd.DataFrame],
+                train_test_split(
+                    filtered_df,
+                    test_size=self.test_size,
+                    random_state=self.random_state,
+                    stratify=stratify_labels,
+                ),
+            )
+        except ValueError as error:
+            raise ValueError(
+                "Failed to create train/test split. Adjust test_size or disable stratify."
+            ) from error
+
+        train_df, test_df = split_frames[0], split_frames[1]
+        logger.info(
+            "Created train/test split before preprocessing: train=%s, test=%s",
+            train_df.shape,
+            test_df.shape,
+        )
+
+        self.split_metadata = {
+            "enabled": True,
+            "test_size": self.test_size,
+            "random_state": self.random_state,
+            "stratify": self.stratify,
+            "train_samples": len(train_df),
+            "test_samples": len(test_df),
+        }
+        return train_df.copy(), test_df.copy()
+
+    def _preprocess_datasets(
+        self, train_df: pd.DataFrame, test_df: pd.DataFrame | None
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        """Fit preprocessing on train data and apply it to all partitions."""
+        train_feature_columns = self._get_feature_columns(train_df)
+        if not train_feature_columns:
+            raise ValueError("No features available for preprocessing")
+
+        train_feature_df = train_df[train_feature_columns]
+        missing_ratio = train_feature_df.isna().sum() / len(train_feature_df)
+        kept_feature_columns = missing_ratio[
+            missing_ratio <= 0.95
+        ].index.tolist()
+        removed_feature_count = len(train_feature_columns) - len(
+            kept_feature_columns
+        )
+
+        logger.info(
+            "Removed %s features with >95%% missing values based on training split",
+            removed_feature_count,
+        )
+
+        if not kept_feature_columns:
+            logger.error("No features remaining after training-only filtering")
             raise ValueError("All features were removed during filtering")
 
-        # Impute missing values
+        train_features = train_df[kept_feature_columns]
+        logger.info(
+            "Training feature shape before imputation: %s", train_features.shape
+        )
+
         imputer = SimpleImputer(strategy="median")
-        X_imputed = pd.DataFrame(
-            imputer.fit_transform(X), columns=X.columns, index=X.index
+        train_imputed_values = cast(Any, imputer.fit_transform(train_features))
+        train_imputed = pd.DataFrame(
+            train_imputed_values,
+            columns=kept_feature_columns,
+            index=train_df.index,
         )
 
-        # Standardize features
         scaler = StandardScaler()
-        X_scaled = pd.DataFrame(
-            scaler.fit_transform(X_imputed),
-            columns=X_imputed.columns,
-            index=X_imputed.index,
+        train_scaled_values = cast(Any, scaler.fit_transform(train_imputed))
+        train_scaled = pd.DataFrame(
+            train_scaled_values,
+            columns=kept_feature_columns,
+            index=train_df.index,
         )
 
-        # Store final data
-        self.final_df = X_scaled
-        self.final_df["hospital_expire_flag"] = y
+        processed_train_df = train_scaled.copy()
+        processed_train_df["hospital_expire_flag"] = train_df[
+            "hospital_expire_flag"
+        ]
+
+        processed_test_df = None
+        if test_df is not None:
+            test_features = test_df[kept_feature_columns]
+            test_imputed_values = cast(Any, imputer.transform(test_features))
+            test_imputed = pd.DataFrame(
+                test_imputed_values,
+                columns=kept_feature_columns,
+                index=test_df.index,
+            )
+            test_scaled_values = cast(Any, scaler.transform(test_imputed))
+            test_scaled = pd.DataFrame(
+                test_scaled_values,
+                columns=kept_feature_columns,
+                index=test_df.index,
+            )
+            processed_test_df = test_scaled.copy()
+            processed_test_df["hospital_expire_flag"] = test_df[
+                "hospital_expire_flag"
+            ]
+
+        fit_scope = "train_only" if test_df is not None else "all_data"
+        self.preprocessing_metadata = {
+            "fit_scope": fit_scope,
+            "imputer": "median",
+            "scaler": "standard",
+            "feature_filter_source": fit_scope,
+            "removed_feature_count": removed_feature_count,
+            "feature_count_after_filtering": len(kept_feature_columns),
+        }
+
+        return processed_train_df, processed_test_df
 
     def _save_output(self, target_path: Path) -> None:
         """Save processed data to target directory."""
-        # Separate features and labels
-        y = self.final_df["hospital_expire_flag"]
-        X = self.final_df.drop(columns=["hospital_expire_flag"])
+        full_df = self._require_frame(self.full_df, "full_df")
+        train_df = self._require_frame(self.train_df, "train_df")
 
-        # Save feature matrix
-        X.to_csv(target_path / "X.csv", index=False)
-        logger.info(f"Saved feature matrix: {X.shape}")
+        full_features = full_df.drop(columns=["hospital_expire_flag"])
+        full_labels = full_df["hospital_expire_flag"]
 
-        # Save labels
-        y.to_csv(target_path / "y.csv", index=False, header=True)
-        logger.info(f"Saved labels: {len(y)}")
+        if self.split_enabled:
+            test_df = self._require_frame(self.test_df, "test_df")
 
-        # Save feature names
+            train_features = train_df.drop(columns=["hospital_expire_flag"])
+            train_labels = train_df["hospital_expire_flag"]
+            test_features = test_df.drop(columns=["hospital_expire_flag"])
+            test_labels = test_df["hospital_expire_flag"]
+
+            train_features.to_csv(target_path / "X_train.csv", index=False)
+            test_features.to_csv(target_path / "X_test.csv", index=False)
+            train_labels.to_csv(
+                target_path / "y_train.csv", index=False, header=True
+            )
+            test_labels.to_csv(
+                target_path / "y_test.csv", index=False, header=True
+            )
+
+            logger.info(
+                "Saved train/test split outputs: train=%s, test=%s",
+                train_features.shape,
+                test_features.shape,
+            )
+        else:
+            self.split_metadata = {
+                "enabled": False,
+                "test_size": None,
+                "random_state": self.random_state,
+                "stratify": self.stratify,
+                "train_samples": len(train_df),
+                "test_samples": 0,
+            }
+            logger.info("Train/test split disabled; exported full dataset only")
+
+        full_features.to_csv(target_path / "X.csv", index=False)
+        logger.info(f"Saved feature matrix: {full_features.shape}")
+
+        full_labels.to_csv(target_path / "y.csv", index=False, header=True)
+        logger.info(f"Saved labels: {len(full_labels)}")
+
         with open(target_path / "feature_names.txt", "w") as f:
-            f.write("\n".join(X.columns))
-        logger.info(f"Saved {len(X.columns)} feature names")
+            f.write("\n".join(full_features.columns))
+        logger.info(f"Saved {len(full_features.columns)} feature names")
 
-        # Save metadata
-        metadata = {
-            "n_samples": len(X),
-            "n_features": len(X.columns),
-            "mortality_rate": float(y.mean()),
+        metadata: dict[str, Any] = {
+            "n_samples": len(full_features),
+            "n_features": len(full_features.columns),
+            "mortality_rate": float(full_labels.mean()),
             "processing_date": datetime.now().isoformat(),
             "time_window_hours": self.TIME_WINDOW_HOURS,
             "sepsis_codes": self.SEPSIS_ICD9_CODES,
+            "sample_filtering": self.sample_filtering_metadata,
+            "split": self.split_metadata,
+            "preprocessing": self.preprocessing_metadata,
         }
 
         with open(target_path / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
         logger.info("Saved metadata")
+
+    def _get_feature_columns(self, df: pd.DataFrame) -> list[str]:
+        """Return model feature columns excluding identifiers and labels."""
+        return [
+            column
+            for column in df.columns
+            if column not in {"subject_id", "hadm_id", "hospital_expire_flag"}
+        ]
+
+    def _require_frame(
+        self, frame: pd.DataFrame | None, name: str
+    ) -> pd.DataFrame:
+        """Require a DataFrame attribute to be populated before use."""
+        if frame is None:
+            raise RuntimeError(f"Required dataframe '{name}' has not been set")
+        return frame
