@@ -1,7 +1,7 @@
 """Model training CLI commands."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 import typer
 import logging
 
@@ -93,6 +93,59 @@ def train(
         typer.echo(
             f"✓ Model '{model}' trained successfully. Weights exported to {output}"
         )
+
+        metrics_file = output / "metrics.json"
+        if metrics_file.exists():
+            typer.echo(f"Evaluation report: {metrics_file}")
+
+        get_eval_summary = getattr(
+            model_instance, "get_evaluation_summary", None
+        )
+        if callable(get_eval_summary):
+            eval_summary = cast(dict[str, Any], get_eval_summary())
+            if eval_summary.get("evaluated"):
+                metrics = cast(dict[str, Any], eval_summary.get("metrics", {}))
+                typer.echo(
+                    "Evaluation metrics: "
+                    f"Accuracy={metrics.get('accuracy')}, "
+                    f"Precision={metrics.get('precision')}, "
+                    f"Recall={metrics.get('recall')}, "
+                    f"F1={metrics.get('f1')}, "
+                    f"ROC-AUC={metrics.get('roc_auc')}, "
+                    f"PR-AUC={metrics.get('pr_auc')}"
+                )
+
+                curve_files = cast(
+                    dict[str, Any], eval_summary.get("curve_files", {})
+                )
+                curve_points_file = curve_files.get("points")
+                if isinstance(curve_points_file, str):
+                    typer.echo(f"Curve points: {output / curve_points_file}")
+
+                roc_curve_file = curve_files.get("roc")
+                if isinstance(roc_curve_file, str):
+                    typer.echo(f"ROC curve: {output / roc_curve_file}")
+
+                pr_curve_file = curve_files.get("pr")
+                if isinstance(pr_curve_file, str):
+                    typer.echo(f"PR curve: {output / pr_curve_file}")
+
+                rendering = cast(
+                    dict[str, Any], eval_summary.get("curve_rendering", {})
+                )
+                if rendering:
+                    roc_render = cast(dict[str, Any], rendering.get("roc", {}))
+                    if not roc_render.get("rendered"):
+                        reason = roc_render.get("skipped_reason", "unknown")
+                        typer.echo(f"ROC curve skipped: {reason}")
+
+                    pr_render = cast(dict[str, Any], rendering.get("pr", {}))
+                    if not pr_render.get("rendered"):
+                        reason = pr_render.get("skipped_reason", "unknown")
+                        typer.echo(f"PR curve skipped: {reason}")
+            else:
+                reason = eval_summary.get("reason", "unknown")
+                typer.echo(f"Evaluation skipped: {reason}")
 
     except typer.Exit:
         raise

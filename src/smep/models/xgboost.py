@@ -11,12 +11,24 @@ Data format:
 
 import json
 import logging
+import importlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 
 from xgboost import XGBClassifier
 
@@ -29,6 +41,8 @@ _X_FILE = "X.csv"
 _Y_FILE = "y.csv"
 _X_TRAIN_FILE = "X_train.csv"
 _Y_TRAIN_FILE = "y_train.csv"
+_X_TEST_FILE = "X_test.csv"
+_Y_TEST_FILE = "y_test.csv"
 _FEATURE_NAMES_FILE = "feature_names.txt"
 _METADATA_FILE = "metadata.json"
 
@@ -36,6 +50,10 @@ _METADATA_FILE = "metadata.json"
 _MODEL_FILE = "xgboost_model.joblib"
 _FEATURE_NAMES_OUT_FILE = "feature_names.txt"
 _METADATA_OUT_FILE = "metadata.json"
+_METRICS_OUT_FILE = "metrics.json"
+_CURVE_POINTS_FILE = "curve_points.json"
+_ROC_PLOT_FILE = "roc_curve.png"
+_PR_PLOT_FILE = "pr_curve.png"
 
 
 class XGBoostModel(Model):
@@ -61,6 +79,11 @@ class XGBoostModel(Model):
             "X": _X_FILE,
             "y": _Y_FILE,
         }
+        self._evaluation_metrics: dict[str, Any] = {
+            "evaluated": False,
+            "reason": "evaluation not run yet",
+        }
+        self._curve_points: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -124,14 +147,18 @@ class XGBoostModel(Model):
         self._is_trained = True
         logger.info("Training complete.")
 
+        self._evaluation_metrics = self._evaluate_on_available_test_data(
+            source_path
+        )
+
     def export(self, output_path: Path) -> None:
         """Export the trained model and preprocessors to output_path directory.
 
         Exported files:
         - xgboost_model.joblib: XGBClassifier weights
-        - xgboost_scaler.joblib: StandardScaler parameters
         - feature_names.txt: Feature name list
         - metadata.json: Metadata including original dataset info and training config
+        - metrics.json: Post-training test-set evaluation metrics
 
         Args:
             output_path: Export directory path (created automatically if not exists).
@@ -175,6 +202,36 @@ class XGBoostModel(Model):
             encoding="utf-8",
         )
         logger.info(f"Metadata exported to {meta_file}")
+
+        export_eval_payload = dict(self._evaluation_metrics)
+        curve_points_file = output_path / _CURVE_POINTS_FILE
+
+        if self._curve_points is not None:
+            curve_points_file.write_text(
+                json.dumps(self._curve_points, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(f"Curve points exported to {curve_points_file}")
+
+            curve_rendering = self._render_curves(
+                self._curve_points, output_path
+            )
+            export_eval_payload["curve_rendering"] = curve_rendering
+
+            curve_files: dict[str, str] = {"points": _CURVE_POINTS_FILE}
+            if curve_rendering.get("roc", {}).get("rendered"):
+                curve_files["roc"] = _ROC_PLOT_FILE
+            if curve_rendering.get("pr", {}).get("rendered"):
+                curve_files["pr"] = _PR_PLOT_FILE
+            export_eval_payload["curve_files"] = curve_files
+
+        metrics_file = output_path / _METRICS_OUT_FILE
+        metrics_file.write_text(
+            json.dumps(export_eval_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._evaluation_metrics = export_eval_payload
+        logger.info(f"Evaluation metrics exported to {metrics_file}")
 
     def load(self, weight_path: Path) -> None:
         """Load trained weights from weight_path directory.
@@ -244,6 +301,10 @@ class XGBoostModel(Model):
         logger.info("Inference complete.")
         return proba
 
+    def get_evaluation_summary(self) -> dict[str, Any]:
+        """Return evaluation payload collected during the latest training."""
+        return self._evaluation_metrics.copy()
+
     # ------------------------------------------------------------------
     # Private helper methods
     # ------------------------------------------------------------------
@@ -277,6 +338,232 @@ class XGBoostModel(Model):
             _Y_FILE,
         )
         return self._load_data(source_path)
+
+    def _load_test_data(
+        self, source_path: Path
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Load test split data when available, otherwise return None."""
+        test_x_file = source_path / _X_TEST_FILE
+        test_y_file = source_path / _Y_TEST_FILE
+
+        if not test_x_file.exists() or not test_y_file.exists():
+            return None
+
+        logger.info(
+            "Detected processed test split files; using %s and %s",
+            test_x_file.name,
+            test_y_file.name,
+        )
+        return self._load_data_files(test_x_file, test_y_file)
+
+    def _evaluate_on_available_test_data(
+        self, source_path: Path
+    ) -> dict[str, Any]:
+        """Evaluate on test split if available, otherwise return skipped payload."""
+        if not self._is_trained or self._classifier is None:
+            return {
+                "evaluated": False,
+                "reason": "model not trained",
+            }
+
+        test_data = self._load_test_data(source_path)
+        if test_data is None:
+            logger.info("Test split files not found; skipping evaluation")
+            return {
+                "evaluated": False,
+                "reason": "test split files not found",
+                "expected_files": [_X_TEST_FILE, _Y_TEST_FILE],
+                "training_data_files": self._training_data_files.copy(),
+            }
+
+        X_test, y_test = test_data
+        y_score = self._classifier.predict_proba(X_test)[:, 1]
+        y_pred = (y_score >= 0.5).astype(np.int32)
+        self._curve_points = self._build_curve_points(y_test, y_score)
+
+        metrics: dict[str, float | None] = {
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "precision": float(
+                precision_score(y_test, y_pred, zero_division=0)
+            ),
+            "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+            "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+            "roc_auc": None,
+            "pr_auc": None,
+        }
+
+        try:
+            metrics["roc_auc"] = float(roc_auc_score(y_test, y_score))
+        except ValueError:
+            logger.warning(
+                "ROC-AUC is undefined for the current test-set label distribution"
+            )
+
+        try:
+            metrics["pr_auc"] = float(average_precision_score(y_test, y_score))
+        except ValueError:
+            logger.warning(
+                "PR-AUC is undefined for the current test-set label distribution"
+            )
+
+        matrix = confusion_matrix(y_test, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = matrix.ravel()
+
+        payload: dict[str, Any] = {
+            "evaluated": True,
+            "model": "xgboost",
+            "threshold": 0.5,
+            "test_set": {
+                "n_samples": int(len(y_test)),
+                "positive_rate": float(y_test.mean()),
+                "source_files": {
+                    "X": _X_TEST_FILE,
+                    "y": _Y_TEST_FILE,
+                },
+            },
+            "metrics": metrics,
+            "confusion_matrix": {
+                "tn": int(tn),
+                "fp": int(fp),
+                "fn": int(fn),
+                "tp": int(tp),
+            },
+            "training_data_files": self._training_data_files.copy(),
+        }
+        logger.info("Test-set evaluation complete: %s", payload["metrics"])
+        return payload
+
+    def _build_curve_points(
+        self, y_true: np.ndarray, y_score: np.ndarray
+    ) -> dict[str, Any]:
+        """Build serializable ROC/PR curve points."""
+
+        def _safe_float_list(values: Any) -> list[float | None]:
+            output: list[float | None] = []
+            for value in values:
+                number = float(value)
+                if np.isfinite(number):
+                    output.append(number)
+                else:
+                    output.append(None)
+            return output
+
+        points: dict[str, Any] = {}
+
+        try:
+            fpr, tpr, roc_thresholds = roc_curve(y_true, y_score)
+            points["roc"] = {
+                "fpr": _safe_float_list(fpr),
+                "tpr": _safe_float_list(tpr),
+                "thresholds": _safe_float_list(roc_thresholds),
+            }
+        except ValueError as error:
+            points["roc"] = {
+                "error": str(error),
+                "fpr": [],
+                "tpr": [],
+                "thresholds": [],
+            }
+
+        try:
+            precision, recall, pr_thresholds = precision_recall_curve(
+                y_true, y_score
+            )
+            points["pr"] = {
+                "precision": _safe_float_list(precision),
+                "recall": _safe_float_list(recall),
+                "thresholds": _safe_float_list(pr_thresholds),
+            }
+        except ValueError as error:
+            points["pr"] = {
+                "error": str(error),
+                "precision": [],
+                "recall": [],
+                "thresholds": [],
+            }
+
+        return points
+
+    def _render_curves(
+        self, curve_points: dict[str, Any], output_path: Path
+    ) -> dict[str, Any]:
+        """Render ROC/PR curves when plotting dependency is available."""
+        try:
+            matplotlib_module = importlib.import_module("matplotlib")
+            matplotlib = cast(Any, matplotlib_module)
+            matplotlib.use("Agg")
+            plt = cast(Any, importlib.import_module("matplotlib.pyplot"))
+        except Exception as error:
+            reason = f"matplotlib unavailable: {error}"
+            logger.warning("Skipping curve rendering: %s", reason)
+            return {
+                "roc": {"rendered": False, "skipped_reason": reason},
+                "pr": {"rendered": False, "skipped_reason": reason},
+            }
+
+        rendering_status: dict[str, Any] = {
+            "roc": {"rendered": False},
+            "pr": {"rendered": False},
+        }
+
+        roc_points = curve_points.get("roc", {})
+        if isinstance(roc_points, dict):
+            fpr = cast(list[float], roc_points.get("fpr", []))
+            tpr = cast(list[float], roc_points.get("tpr", []))
+            if fpr and tpr:
+                roc_path = output_path / _ROC_PLOT_FILE
+                fig = plt.figure(figsize=(6, 6))
+                plt.plot(fpr, tpr, linewidth=2, label="ROC")
+                plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
+                plt.xlim(0.0, 1.0)
+                plt.ylim(0.0, 1.05)
+                plt.xlabel("False Positive Rate")
+                plt.ylabel("True Positive Rate")
+                plt.title("ROC Curve")
+                plt.grid(alpha=0.3)
+                plt.legend(loc="lower right")
+                plt.tight_layout()
+                fig.savefig(str(roc_path), dpi=150)
+                plt.close(fig)
+                rendering_status["roc"] = {
+                    "rendered": True,
+                    "file": _ROC_PLOT_FILE,
+                }
+            else:
+                rendering_status["roc"] = {
+                    "rendered": False,
+                    "skipped_reason": "ROC curve points unavailable",
+                }
+
+        pr_points = curve_points.get("pr", {})
+        if isinstance(pr_points, dict):
+            precision = cast(list[float], pr_points.get("precision", []))
+            recall = cast(list[float], pr_points.get("recall", []))
+            if precision and recall:
+                pr_path = output_path / _PR_PLOT_FILE
+                fig = plt.figure(figsize=(6, 6))
+                plt.plot(recall, precision, linewidth=2, label="PR")
+                plt.xlim(0.0, 1.0)
+                plt.ylim(0.0, 1.05)
+                plt.xlabel("Recall")
+                plt.ylabel("Precision")
+                plt.title("Precision-Recall Curve")
+                plt.grid(alpha=0.3)
+                plt.legend(loc="lower left")
+                plt.tight_layout()
+                fig.savefig(str(pr_path), dpi=150)
+                plt.close(fig)
+                rendering_status["pr"] = {
+                    "rendered": True,
+                    "file": _PR_PLOT_FILE,
+                }
+            else:
+                rendering_status["pr"] = {
+                    "rendered": False,
+                    "skipped_reason": "PR curve points unavailable",
+                }
+
+        return rendering_status
 
     def _load_data(self, source_path: Path) -> tuple[np.ndarray, np.ndarray]:
         """Load feature matrix and label vector.
