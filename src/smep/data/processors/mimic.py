@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import logging
 from datetime import datetime
+from collections.abc import Iterator
 from typing import Any, cast
 import pandas as pd
 from sklearn.impute import SimpleImputer
@@ -120,7 +121,10 @@ class MIMIC3Processor(DataProcessor):
     def _filter_sepsis_cohort(self, source_path: Path) -> None:
         """Filter patients with sepsis diagnosis."""
         diagnoses_path = source_path / "DIAGNOSES_ICD.csv"
-        diagnoses_df = pd.read_csv(diagnoses_path)
+        diagnoses_df = self._read_csv_standard(
+            diagnoses_path,
+            required_columns=["subject_id", "hadm_id", "icd9_code"],
+        )
 
         # Filter for sepsis ICD-9 codes (remove dots from codes)
         sepsis_mask = (
@@ -138,7 +142,14 @@ class MIMIC3Processor(DataProcessor):
     def _extract_labels(self, source_path: Path) -> None:
         """Extract mortality labels."""
         admissions_path = source_path / "ADMISSIONS.csv"
-        admissions_df = pd.read_csv(admissions_path)
+        admissions_df = self._read_csv_standard(
+            admissions_path,
+            required_columns=[
+                "subject_id",
+                "hadm_id",
+                "hospital_expire_flag",
+            ],
+        )
         cohort_df = self._require_frame(self.cohort_df, "cohort_df")
 
         # Merge with cohort to get labels
@@ -157,8 +168,21 @@ class MIMIC3Processor(DataProcessor):
         patients_path = source_path / "PATIENTS.csv"
         admissions_path = source_path / "ADMISSIONS.csv"
 
-        patients_df = pd.read_csv(patients_path)
-        admissions_df = pd.read_csv(admissions_path)
+        patients_df = self._read_csv_standard(
+            patients_path,
+            required_columns=["subject_id", "gender", "dob"],
+        )
+        admissions_df = self._read_csv_standard(
+            admissions_path,
+            required_columns=[
+                "subject_id",
+                "hadm_id",
+                "admittime",
+                "admission_type",
+                "insurance",
+                "ethnicity",
+            ],
+        )
 
         # Merge with cohort
         static_df = self._require_frame(self.cohort_df, "cohort_df").copy()
@@ -217,7 +241,16 @@ class MIMIC3Processor(DataProcessor):
         """Extract and aggregate temporal features from chart events and lab events."""
         # Get ICU stay times
         icustays_path = source_path / "ICUSTAYS.csv"
-        icustays_df = pd.read_csv(icustays_path)
+        icustays_df = self._read_csv_standard(
+            icustays_path,
+            required_columns=[
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "intime",
+                "outtime",
+            ],
+        )
         icustays_df["intime"] = pd.to_datetime(icustays_df["intime"])
         icustays_df["outtime"] = pd.to_datetime(icustays_df["outtime"])
 
@@ -264,7 +297,17 @@ class MIMIC3Processor(DataProcessor):
         raw_rows: list[pd.DataFrame] = []
 
         try:
-            for chunk in pd.read_csv(chartevents_path, chunksize=100000):
+            for chunk in self._read_csv_chunks_standard(
+                chartevents_path,
+                chunksize=100000,
+                required_columns=[
+                    "subject_id",
+                    "hadm_id",
+                    "charttime",
+                    "itemid",
+                    "valuenum",
+                ],
+            ):
                 chunk["charttime"] = pd.to_datetime(chunk["charttime"])
 
                 # Filter for cohort and time window
@@ -333,7 +376,17 @@ class MIMIC3Processor(DataProcessor):
         raw_rows: list[pd.DataFrame] = []
 
         try:
-            for chunk in pd.read_csv(labevents_path, chunksize=100000):
+            for chunk in self._read_csv_chunks_standard(
+                labevents_path,
+                chunksize=100000,
+                required_columns=[
+                    "subject_id",
+                    "hadm_id",
+                    "charttime",
+                    "itemid",
+                    "valuenum",
+                ],
+            ):
                 chunk["charttime"] = pd.to_datetime(chunk["charttime"])
 
                 # Filter for cohort and time window
@@ -667,6 +720,86 @@ class MIMIC3Processor(DataProcessor):
             for column in df.columns
             if column not in {"subject_id", "hadm_id", "hospital_expire_flag"}
         ]
+
+    def _read_csv_standard(
+        self,
+        file_path: Path,
+        required_columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Read CSV with filename and column-name compatibility normalization."""
+        resolved_path = self._resolve_csv_path(file_path)
+        df = pd.read_csv(resolved_path)
+        normalized = self._normalize_columns(df)
+
+        if required_columns:
+            self._validate_required_columns(
+                normalized,
+                required_columns,
+                resolved_path,
+            )
+
+        return normalized
+
+    def _read_csv_chunks_standard(
+        self,
+        file_path: Path,
+        chunksize: int,
+        required_columns: list[str] | None = None,
+    ) -> Iterator[pd.DataFrame]:
+        """Read CSV chunks with normalized column names."""
+        resolved_path = self._resolve_csv_path(file_path)
+        for chunk in pd.read_csv(resolved_path, chunksize=chunksize):
+            normalized = self._normalize_columns(chunk)
+            if required_columns:
+                self._validate_required_columns(
+                    normalized,
+                    required_columns,
+                    resolved_path,
+                )
+            yield normalized
+
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize column names to lowercase for case-insensitive access."""
+        normalized_df = df.copy()
+        normalized_df.columns = [
+            str(column).strip().lower() for column in normalized_df.columns
+        ]
+        return normalized_df
+
+    def _resolve_csv_path(self, file_path: Path) -> Path:
+        """Resolve a CSV path case-insensitively within its parent directory."""
+        if file_path.exists():
+            return file_path
+
+        parent = file_path.parent
+        if not parent.exists() or not parent.is_dir():
+            raise FileNotFoundError(f"Required file not found: {file_path}")
+
+        target_name = file_path.name.lower()
+        for candidate in parent.iterdir():
+            if candidate.is_file() and candidate.name.lower() == target_name:
+                return candidate
+
+        raise FileNotFoundError(f"Required file not found: {file_path}")
+
+    def _validate_required_columns(
+        self,
+        df: pd.DataFrame,
+        required_columns: list[str],
+        source_path: Path,
+    ) -> None:
+        """Validate required columns after normalization."""
+        missing = [
+            column
+            for column in required_columns
+            if column.lower() not in df.columns
+        ]
+        if missing:
+            available = ", ".join(map(str, df.columns))
+            raise ValueError(
+                f"Missing required columns in {source_path}: {missing}. "
+                f"Available columns: {available}"
+            )
 
     def _require_frame(
         self, frame: pd.DataFrame | None, name: str
