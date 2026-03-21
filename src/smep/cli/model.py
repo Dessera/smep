@@ -396,3 +396,110 @@ def infer(
 
     except typer.Exit:
         raise
+
+
+@app.command()
+def explain(
+    model: str = typer.Argument(
+        ..., help="Model name to look up in the registry (e.g. 'xgboost')"
+    ),
+    source: Path = typer.Argument(
+        ...,
+        help="Training output directory containing exported model artifacts",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Output directory for explainability artifacts, "
+            "defaults to ./explanations/<model>_<source_dir_name>"
+        ),
+    ),
+    max_samples: int = typer.Option(
+        500,
+        "--max-samples",
+        help="Maximum number of samples used to compute SHAP explanations.",
+    ),
+) -> None:
+    """Generate explainability artifacts for exported model outputs.
+
+    Example:
+        smep model explain xgboost ./weights/xgboost
+        smep model explain xgboost ./weights/xgboost -o ./explanations/run1
+    """
+    try:
+        source = source.resolve()
+        if not source.exists() or not source.is_dir():
+            typer.echo(
+                f"Error: source directory does not exist: {source}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if max_samples < 1:
+            typer.echo("Error: --max-samples must be >= 1", err=True)
+            raise typer.Exit(code=1)
+
+        if output is None:
+            output = Path.cwd() / "explanations" / f"{model}_{source.name}"
+        else:
+            output = output.resolve()
+        output.mkdir(parents=True, exist_ok=True)
+
+        registry = get_registry()
+        try:
+            model_instance = registry.get_model(model)
+        except KeyError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+
+        explain_method = getattr(model_instance, "explain", None)
+        if not callable(explain_method):
+            typer.echo(
+                f"Error: model '{model}' does not support explain.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        typer.echo(f"Generating explainability artifacts for '{model}'...")
+        typer.echo(f"Source: {source}")
+        typer.echo(f"Output: {output}")
+        typer.echo(f"Max samples: {max_samples}")
+
+        try:
+            explain_summary = cast(
+                dict[str, Any],
+                explain_method(
+                    source,
+                    output,
+                    max_samples=max_samples,
+                ),
+            )
+        except FileNotFoundError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+        except ValueError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+        except RuntimeError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            typer.echo(f"Unexpected error during explain: {e}", err=True)
+            logger.exception("Unexpected error during explain")
+            raise typer.Exit(code=1)
+
+        typer.echo(f"✓ Explainability artifacts generated at {output}")
+        typer.echo(f"Metadata: {output / 'explain_metadata.json'}")
+
+        outputs = cast(dict[str, Any], explain_summary.get("outputs", {}))
+        if isinstance(outputs.get("summary_bar"), str):
+            typer.echo(f"SHAP bar plot: {output / outputs['summary_bar']}")
+        if isinstance(outputs.get("summary_beeswarm"), str):
+            typer.echo(
+                f"SHAP beeswarm plot: {output / outputs['summary_beeswarm']}"
+            )
+
+    except typer.Exit:
+        raise

@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=2.4.3",
   "pandas>=3.0.1",
   "scikit-learn>=1.8.0",
+  "shap>=0.51.0",
   "typer>=0.24.1",
   "xgboost>=3.2.0",
 ]

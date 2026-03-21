@@ -74,3 +74,29 @@ class Model(ABC):
             RuntimeError: If the model has not been loaded.
         """
         pass
+
+    def explain(
+        self,
+        source_path: Path,
+        output_path: Path,
+        max_samples: int = 500,
+    ) -> dict[str, Any]:
+        """Generate explainability artifacts for a trained model.
+
+        This is an optional capability. Model implementations that support
+        explainability should override this method.
+
+        Args:
+            source_path: Path to training/export output directory.
+            output_path: Directory where explainability artifacts are written.
+            max_samples: Maximum number of samples used for explanation.
+
+        Returns:
+            A dictionary summary of explainability execution.
+
+        Raises:
+            RuntimeError: If explainability is not implemented by the model.
+        """
+        raise RuntimeError(
+            f"Model '{self.__class__.__name__}' does not support explain()."
+        )

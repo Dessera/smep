@@ -13,6 +13,7 @@ import json
 import logging
 import importlib
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -56,6 +57,12 @@ _METRICS_OUT_FILE = "metrics.json"
 _CURVE_POINTS_FILE = "curve_points.json"
 _ROC_PLOT_FILE = "roc_curve.png"
 _PR_PLOT_FILE = "pr_curve.png"
+_EXPLAIN_METADATA_FILE = "explain_metadata.json"
+_SHAP_SUMMARY_BAR_FILE = "shap_summary_bar.png"
+_SHAP_SUMMARY_BEESWARM_FILE = "shap_summary_beeswarm.png"
+_SHAP_VALUES_SAMPLE_FILE = "shap_values_sample.csv"
+_SHAP_EXPECTED_VALUE_FILE = "shap_expected_value.json"
+_TOP_FEATURES_FILE = "top_features.json"
 
 
 class XGBoostModel(Model):
@@ -77,6 +84,7 @@ class XGBoostModel(Model):
         self._feature_names: list[str] = []
         self._metadata: dict[str, Any] = {}
         self._is_trained: bool = False
+        self._source_path: Path | None = None
         self._training_data_files: dict[str, str] = {
             "X": _X_FILE,
             "y": _Y_FILE,
@@ -90,6 +98,10 @@ class XGBoostModel(Model):
             "enabled": False,
             "strategy": "none",
             "search_space_source": "none",
+        }
+        self._explain_summary: dict[str, Any] = {
+            "status": "not_run",
+            "reason": "explain not run yet",
         }
 
     # ------------------------------------------------------------------
@@ -118,6 +130,7 @@ class XGBoostModel(Model):
             RuntimeError: If the training process fails.
         """
         source_path = Path(source_path)
+        self._source_path = source_path
         logger.info(f"Loading data from {source_path}...")
 
         X, y = self._load_training_data(source_path)
@@ -256,6 +269,8 @@ class XGBoostModel(Model):
         )
         logger.info(f"Feature names exported to {feature_file}")
 
+        self._export_explain_source_file(output_path)
+
         # Export metadata
         export_metadata = {
             **self._metadata,
@@ -329,6 +344,7 @@ class XGBoostModel(Model):
             RuntimeError: If loading fails.
         """
         weight_path = Path(weight_path)
+        self._source_path = weight_path
         if not weight_path.exists() or not weight_path.is_dir():
             raise FileNotFoundError(
                 f"Weight directory not found: {weight_path}"
@@ -381,6 +397,78 @@ class XGBoostModel(Model):
         logger.info("Inference complete.")
         return proba
 
+    def explain(
+        self,
+        source_path: Path,
+        output_path: Path,
+        max_samples: int = 500,
+    ) -> dict[str, Any]:
+        """Generate SHAP explainability artifacts from exported training output."""
+        if max_samples < 1:
+            raise ValueError("max_samples must be >= 1")
+
+        source_path = Path(source_path)
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        summary: dict[str, Any] = {
+            "method": "shap",
+            "model": "xgboost",
+            "sample_size": 0,
+            "source_file": None,
+            "outputs": {},
+            "status": "failed",
+            "reason": None,
+        }
+
+        try:
+            if not self._is_trained or self._classifier is None:
+                self.load(source_path)
+
+            feature_file = self._resolve_explain_source_file(source_path)
+            summary["source_file"] = feature_file.name
+
+            X_df = pd.read_csv(feature_file)
+            if X_df.empty:
+                raise ValueError(
+                    f"Explain source file is empty: {feature_file}"
+                )
+
+            sample_size = min(len(X_df), max_samples)
+            if sample_size < len(X_df):
+                X_sample = X_df.sample(n=sample_size, random_state=42)
+            else:
+                X_sample = X_df
+            X_sample = X_sample.reset_index(drop=True)
+            summary["sample_size"] = int(len(X_sample))
+
+            outputs = self._build_explanations(X_sample, output_path)
+            summary["outputs"] = outputs
+            summary["status"] = "success"
+        except Exception as error:
+            summary["status"] = "failed"
+            summary["reason"] = str(error)
+            logger.exception("Failed to generate explainability artifacts")
+
+        summary_file = output_path / _EXPLAIN_METADATA_FILE
+        summary_file.write_text(
+            json.dumps(
+                self._to_json_compatible(summary),
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+
+        self._explain_summary = summary.copy()
+
+        if summary["status"] != "success":
+            reason = summary.get("reason") or "unknown explain error"
+            raise RuntimeError(f"Explainability failed: {reason}")
+
+        return summary
+
     def get_evaluation_summary(self) -> dict[str, Any]:
         """Return evaluation payload collected during the latest training."""
         return self._evaluation_metrics.copy()
@@ -389,9 +477,182 @@ class XGBoostModel(Model):
         """Return tuning summary collected during the latest training."""
         return self._tuning_summary.copy()
 
+    def get_explain_summary(self) -> dict[str, Any]:
+        """Return explainability summary from the latest explain run."""
+        return self._explain_summary.copy()
+
     # ------------------------------------------------------------------
     # Private helper methods
     # ------------------------------------------------------------------
+
+    def _resolve_explain_source_file(self, source_path: Path) -> Path:
+        """Pick explain feature source: prefer X_test.csv, fallback to X.csv."""
+        test_file = source_path / _X_TEST_FILE
+        if test_file.exists():
+            return test_file
+
+        full_file = source_path / _X_FILE
+        if full_file.exists():
+            return full_file
+
+        raise FileNotFoundError(
+            "Explain input file not found. Expected one of: "
+            f"{test_file} or {full_file}"
+        )
+
+    def _export_explain_source_file(self, output_path: Path) -> None:
+        """Export explain input feature file alongside model artifacts."""
+        if self._source_path is None:
+            return
+
+        source_file = self._resolve_explain_source_file(self._source_path)
+        target_file = output_path / source_file.name
+        shutil.copy2(source_file, target_file)
+        logger.info("Explain source features exported to %s", target_file)
+
+    def _build_explanations(
+        self, X_sample: pd.DataFrame, output_path: Path
+    ) -> dict[str, str]:
+        """Build SHAP plots and summary files from sampled feature matrix."""
+        if self._classifier is None:
+            raise RuntimeError("Classifier is unavailable for explainability")
+
+        try:
+            shap_module = cast(Any, importlib.import_module("shap"))
+        except Exception as error:
+            raise RuntimeError(f"shap unavailable: {error}") from error
+
+        try:
+            matplotlib_module = cast(Any, importlib.import_module("matplotlib"))
+            matplotlib_module.use("Agg")
+            plt = cast(Any, importlib.import_module("matplotlib.pyplot"))
+        except Exception as error:
+            raise RuntimeError(f"matplotlib unavailable: {error}") from error
+
+        explainer = shap_module.TreeExplainer(self._classifier)
+        raw_shap_values = explainer.shap_values(X_sample)
+        shap_values = self._normalize_shap_values(
+            raw_shap_values,
+            n_samples=len(X_sample),
+            n_features=X_sample.shape[1],
+        )
+
+        # Save SHAP summary bar plot
+        shap_module.summary_plot(
+            shap_values,
+            X_sample,
+            plot_type="bar",
+            show=False,
+            max_display=20,
+        )
+        bar_plot_file = output_path / _SHAP_SUMMARY_BAR_FILE
+        bar_fig = plt.gcf()
+        bar_fig.tight_layout()
+        bar_fig.savefig(str(bar_plot_file), dpi=150)
+        plt.close(bar_fig)
+
+        # Save SHAP beeswarm plot
+        shap_module.summary_plot(
+            shap_values,
+            X_sample,
+            show=False,
+            max_display=20,
+        )
+        beeswarm_file = output_path / _SHAP_SUMMARY_BEESWARM_FILE
+        beeswarm_fig = plt.gcf()
+        beeswarm_fig.tight_layout()
+        beeswarm_fig.savefig(str(beeswarm_file), dpi=150)
+        plt.close(beeswarm_fig)
+
+        # Save sampled SHAP values as CSV for analysis.
+        shap_df = pd.DataFrame(shap_values, columns=X_sample.columns)
+        shap_sample_file = output_path / _SHAP_VALUES_SAMPLE_FILE
+        shap_df.to_csv(shap_sample_file, index=False)
+
+        mean_abs = np.abs(shap_values).mean(axis=0)
+        order = np.argsort(mean_abs)[::-1]
+        top_features: list[dict[str, float | str]] = [
+            {
+                "feature": str(X_sample.columns[int(idx)]),
+                "mean_abs_shap": float(mean_abs[int(idx)]),
+            }
+            for idx in order[: min(20, len(order))]
+        ]
+        top_features_file = output_path / _TOP_FEATURES_FILE
+        top_features_file.write_text(
+            json.dumps(top_features, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        expected_value_payload = {
+            "expected_value": self._normalize_expected_value(
+                explainer.expected_value
+            ),
+            "n_samples": int(len(X_sample)),
+            "n_features": int(X_sample.shape[1]),
+            "shap_version": str(getattr(shap_module, "__version__", "unknown")),
+        }
+        expected_value_file = output_path / _SHAP_EXPECTED_VALUE_FILE
+        expected_value_file.write_text(
+            json.dumps(
+                self._to_json_compatible(expected_value_payload),
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+
+        return {
+            "summary_bar": _SHAP_SUMMARY_BAR_FILE,
+            "summary_beeswarm": _SHAP_SUMMARY_BEESWARM_FILE,
+            "shap_values_sample": _SHAP_VALUES_SAMPLE_FILE,
+            "expected_value": _SHAP_EXPECTED_VALUE_FILE,
+            "top_features": _TOP_FEATURES_FILE,
+            "metadata": _EXPLAIN_METADATA_FILE,
+        }
+
+    def _normalize_shap_values(
+        self,
+        raw_values: Any,
+        n_samples: int,
+        n_features: int,
+    ) -> np.ndarray:
+        """Normalize SHAP output variants into a 2-D sample-feature array."""
+        values = raw_values
+        if isinstance(values, list):
+            if not values:
+                raise RuntimeError("SHAP returned empty value list")
+            values = values[-1]
+
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim == 3:
+            array = array[:, :, -1]
+        if array.ndim != 2:
+            raise RuntimeError(f"Unexpected SHAP value shape: {array.shape}")
+
+        if array.shape[0] != n_samples and array.shape[1] == n_samples:
+            array = array.T
+
+        if array.shape != (n_samples, n_features):
+            raise RuntimeError(
+                "Unexpected normalized SHAP matrix shape: "
+                f"{array.shape}, expected {(n_samples, n_features)}"
+            )
+
+        return array
+
+    def _normalize_expected_value(self, value: Any) -> float | None:
+        """Normalize SHAP expected value payload into a JSON-safe scalar."""
+        if isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) == 0:
+                return None
+            value = value[-1]
+
+        number = float(value)
+        if math.isfinite(number):
+            return number
+        return None
 
     def _normalize_tuning_config(
         self, tuning: dict[str, Any] | None
