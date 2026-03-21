@@ -16,11 +16,16 @@ class Model(ABC):
     """
 
     @abstractmethod
-    def train(self, source_path: Path) -> None:
+    def train(
+        self,
+        source_path: Path,
+        tuning: dict[str, Any] | None = None,
+    ) -> None:
         """Load processed data from source_path and train the model.
 
         Args:
             source_path: Path to the processed data directory.
+            tuning: Optional hyperparameter tuning config.
 
         Raises:
             FileNotFoundError: If required data files do not exist.

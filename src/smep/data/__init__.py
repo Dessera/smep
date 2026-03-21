@@ -6,7 +6,8 @@ from .fetchers import (
     DataFetcherRegistry,
     KaggleDownloadError,
     KaggleFetcher,
-    MIMIC3Fetcher,
+    MIMIC3DemoFetcher,
+    MIMIC310KFetcher,
     get_registry,
 )
 
@@ -23,7 +24,8 @@ __all__ = [
     "DataFetcher",
     "KaggleFetcher",
     "KaggleDownloadError",
-    "MIMIC3Fetcher",
+    "MIMIC3DemoFetcher",
+    "MIMIC310KFetcher",
     "DataFetcherRegistry",
     "get_registry",
     # Processors

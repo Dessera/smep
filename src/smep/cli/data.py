@@ -18,7 +18,7 @@ app = typer.Typer(
 @app.command()
 def fetch(
     name: str = typer.Argument(
-        ..., help="Name of the data source to fetch (e.g., 'mimic3')"
+        ..., help="Name of the data source to fetch (e.g., 'mimic3-demo')"
     ),
     output: Optional[Path] = typer.Option(
         None,
@@ -30,8 +30,8 @@ def fetch(
     """Fetch data from a specified source.
 
     Example:
-        smep data fetch mimic3
-        smep data fetch mimic3 --output /path/to/data
+        smep data fetch mimic3-demo
+        smep data fetch mimic3-demo --output /path/to/data
     """
     try:
         # Use current working directory if output not specified
@@ -110,7 +110,7 @@ def info(
     """Show detailed information about a data source.
 
     Example:
-        smep data info mimic3
+        smep data info mimic3-demo
     """
     try:
         registry = get_registry()
@@ -285,7 +285,7 @@ def processor_info(
     """Show detailed information about a data processor.
 
     Example:
-        smep data processor-info mimic3
+        smep data processor-info mimic3-demo
     """
     try:
         registry = get_processor_registry()

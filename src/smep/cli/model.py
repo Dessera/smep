@@ -1,5 +1,6 @@
 """Model training CLI commands."""
 
+import json
 from pathlib import Path
 from typing import Any, Optional, cast
 import typer
@@ -28,6 +29,31 @@ def train(
         "--output",
         "-o",
         help="Output path for exported weights, defaults to ./weights/<model>",
+    ),
+    tuning_strategy: str = typer.Option(
+        "none",
+        "--tuning-strategy",
+        help="Hyperparameter tuning strategy: none, grid, or random.",
+    ),
+    cv: int = typer.Option(
+        5,
+        "--cv",
+        help="Cross-validation folds for tuning.",
+    ),
+    scoring: str = typer.Option(
+        "roc_auc",
+        "--scoring",
+        help="Scoring metric used by tuning search.",
+    ),
+    n_iter: int = typer.Option(
+        30,
+        "--n-iter",
+        help="Number of sampled candidates when strategy is random.",
+    ),
+    param_space: Optional[Path] = typer.Option(
+        None,
+        "--param-space",
+        help="JSON file containing param_grid or param_distributions.",
     ),
 ) -> None:
     """Train the specified model and export weights to the given path.
@@ -58,13 +84,71 @@ def train(
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)
 
+        strategy = tuning_strategy.strip().lower()
+        valid_strategies = {"none", "grid", "random"}
+        if strategy not in valid_strategies:
+            typer.echo(
+                "Error: --tuning-strategy must be one of: none, grid, random",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if cv < 2:
+            typer.echo("Error: --cv must be >= 2", err=True)
+            raise typer.Exit(code=1)
+
+        if n_iter < 1:
+            typer.echo("Error: --n-iter must be >= 1", err=True)
+            raise typer.Exit(code=1)
+
+        tuning: dict[str, Any] = {
+            "strategy": strategy,
+            "cv": cv,
+            "scoring": scoring,
+            "n_iter": n_iter,
+            "n_jobs": -1,
+            "random_state": 42,
+        }
+
+        if param_space is not None:
+            param_space = param_space.resolve()
+            if not param_space.exists():
+                typer.echo(
+                    f"Error: param-space file does not exist: {param_space}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            try:
+                parsed_space = json.loads(
+                    param_space.read_text(encoding="utf-8")
+                )
+            except json.JSONDecodeError as e:
+                typer.echo(
+                    f"Error: invalid JSON in param-space file: {e}", err=True
+                )
+                raise typer.Exit(code=1)
+
+            if not isinstance(parsed_space, dict):
+                typer.echo(
+                    "Error: param-space JSON must be an object/dict",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            if strategy == "grid":
+                tuning["param_grid"] = parsed_space
+            elif strategy == "random":
+                tuning["param_distributions"] = parsed_space
+
         # Train model
         typer.echo(f"Training model '{model}'...")
         typer.echo(f"Source: {source}")
         typer.echo(f"Output: {output}")
+        typer.echo(f"Tuning strategy: {strategy}")
 
         try:
-            model_instance.train(source)
+            model_instance.train(source, tuning=tuning)
         except FileNotFoundError as e:
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)

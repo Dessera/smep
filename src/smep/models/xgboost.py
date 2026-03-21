@@ -12,6 +12,7 @@ Data format:
 import json
 import logging
 import importlib
+import math
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -29,6 +30,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
 from xgboost import XGBClassifier
 
@@ -84,12 +86,21 @@ class XGBoostModel(Model):
             "reason": "evaluation not run yet",
         }
         self._curve_points: dict[str, Any] | None = None
+        self._tuning_summary: dict[str, Any] = {
+            "enabled": False,
+            "strategy": "none",
+            "search_space_source": "none",
+        }
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def train(self, source_path: Path) -> None:
+    def train(
+        self,
+        source_path: Path,
+        tuning: dict[str, Any] | None = None,
+    ) -> None:
         """Load processed data from source_path and train the XGBoost model.
 
         Training pipeline:
@@ -99,6 +110,7 @@ class XGBoostModel(Model):
 
         Args:
             source_path: Path to the processed data directory.
+            tuning: Optional hyperparameter tuning configuration.
 
         Raises:
             FileNotFoundError: If required data files are missing.
@@ -120,7 +132,7 @@ class XGBoostModel(Model):
 
         # Build classifier (hyperparameters tuned for small datasets)
         scale_pos_weight = (y == 0).sum() / max((y == 1).sum(), 1)
-        self._classifier = XGBClassifier(
+        base_classifier = XGBClassifier(
             n_estimators=200,
             max_depth=4,
             learning_rate=0.05,
@@ -137,13 +149,69 @@ class XGBoostModel(Model):
             n_jobs=-1,
         )
 
+        tuning_config = self._normalize_tuning_config(tuning)
+        self._tuning_summary = {
+            "enabled": tuning_config["strategy"] != "none",
+            "strategy": tuning_config["strategy"],
+            "cv": tuning_config["cv"],
+            "scoring": tuning_config["scoring"],
+            "search_space_source": tuning_config["search_space_source"],
+            "best_params": None,
+            "best_cv_score": None,
+            "n_candidates": None,
+        }
+
         # Train model on the selected training dataset
         logger.info(
             "Training model using %s and %s...",
             self._training_data_files["X"],
             self._training_data_files["y"],
         )
-        self._classifier.fit(X, y)
+
+        strategy = tuning_config["strategy"]
+        if strategy == "none":
+            self._classifier = base_classifier
+            self._classifier.fit(X, y)
+        elif strategy == "grid":
+            search = GridSearchCV(
+                estimator=base_classifier,
+                param_grid=tuning_config["param_grid"],
+                cv=tuning_config["cv"],
+                scoring=tuning_config["scoring"],
+                n_jobs=tuning_config["n_jobs"],
+                refit=True,
+            )
+            search.fit(X, y)
+            self._classifier = cast(XGBClassifier, search.best_estimator_)
+            self._tuning_summary["best_params"] = cast(
+                dict[str, Any], search.best_params_
+            )
+            self._tuning_summary["best_cv_score"] = float(search.best_score_)
+            self._tuning_summary["n_candidates"] = len(
+                cast(dict[str, Any], search.cv_results_)["params"]
+            )
+        else:
+            search = RandomizedSearchCV(
+                estimator=base_classifier,
+                param_distributions=tuning_config["param_distributions"],
+                n_iter=tuning_config["n_iter"],
+                cv=tuning_config["cv"],
+                scoring=tuning_config["scoring"],
+                n_jobs=tuning_config["n_jobs"],
+                random_state=tuning_config["random_state"],
+                refit=True,
+            )
+            search.fit(X, y)
+            self._classifier = cast(XGBClassifier, search.best_estimator_)
+            self._tuning_summary["best_params"] = cast(
+                dict[str, Any], search.best_params_
+            )
+            self._tuning_summary["best_cv_score"] = float(search.best_score_)
+            self._tuning_summary["n_candidates"] = len(
+                cast(dict[str, Any], search.cv_results_)["params"]
+            )
+
+        self._metadata["hyperparameter_tuning"] = self._tuning_summary.copy()
         self._is_trained = True
         logger.info("Training complete.")
 
@@ -196,9 +264,15 @@ class XGBoostModel(Model):
             "n_features": len(self._feature_names),
             "classifier_params": self._classifier.get_params(),
         }
+        export_metadata = self._to_json_compatible(export_metadata)
         meta_file = output_path / _METADATA_OUT_FILE
         meta_file.write_text(
-            json.dumps(export_metadata, indent=2, ensure_ascii=False),
+            json.dumps(
+                export_metadata,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
             encoding="utf-8",
         )
         logger.info(f"Metadata exported to {meta_file}")
@@ -226,8 +300,14 @@ class XGBoostModel(Model):
             export_eval_payload["curve_files"] = curve_files
 
         metrics_file = output_path / _METRICS_OUT_FILE
+        export_eval_payload = self._to_json_compatible(export_eval_payload)
         metrics_file.write_text(
-            json.dumps(export_eval_payload, indent=2, ensure_ascii=False),
+            json.dumps(
+                export_eval_payload,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
             encoding="utf-8",
         )
         self._evaluation_metrics = export_eval_payload
@@ -305,9 +385,80 @@ class XGBoostModel(Model):
         """Return evaluation payload collected during the latest training."""
         return self._evaluation_metrics.copy()
 
+    def get_tuning_summary(self) -> dict[str, Any]:
+        """Return tuning summary collected during the latest training."""
+        return self._tuning_summary.copy()
+
     # ------------------------------------------------------------------
     # Private helper methods
     # ------------------------------------------------------------------
+
+    def _normalize_tuning_config(
+        self, tuning: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Normalize and validate optional tuning configuration."""
+        default_grid = {
+            "max_depth": [3, 4, 5, 6],
+            "learning_rate": [0.01, 0.05, 0.1],
+            "n_estimators": [100, 200, 300],
+            "subsample": [0.7, 0.8, 1.0],
+            "colsample_bytree": [0.7, 0.8, 1.0],
+            "min_child_weight": [1, 3, 5],
+        }
+
+        config = tuning.copy() if tuning is not None else {}
+        strategy = str(config.get("strategy", "none")).strip().lower()
+        if strategy not in {"none", "grid", "random"}:
+            raise ValueError(
+                "Invalid tuning strategy. Expected one of: none, grid, random"
+            )
+
+        cv = int(config.get("cv", 5))
+        if cv < 2:
+            raise ValueError("cv must be >= 2")
+
+        scoring = str(config.get("scoring", "roc_auc"))
+        n_jobs = int(config.get("n_jobs", -1))
+        n_iter = int(config.get("n_iter", 30))
+        random_state = int(config.get("random_state", 42))
+
+        normalized: dict[str, Any] = {
+            "strategy": strategy,
+            "cv": cv,
+            "scoring": scoring,
+            "n_jobs": n_jobs,
+            "n_iter": n_iter,
+            "random_state": random_state,
+            "search_space_source": "none",
+            "param_grid": None,
+            "param_distributions": None,
+        }
+
+        if strategy == "grid":
+            param_grid = config.get("param_grid")
+            if param_grid is None:
+                param_grid = default_grid
+                normalized["search_space_source"] = "default"
+            else:
+                if not isinstance(param_grid, dict):
+                    raise ValueError("param_grid must be a dict")
+                normalized["search_space_source"] = "provided"
+            normalized["param_grid"] = param_grid
+
+        if strategy == "random":
+            param_distributions = config.get("param_distributions")
+            if param_distributions is None:
+                param_distributions = default_grid
+                normalized["search_space_source"] = "default"
+            else:
+                if not isinstance(param_distributions, dict):
+                    raise ValueError("param_distributions must be a dict")
+                normalized["search_space_source"] = "provided"
+            if n_iter < 1:
+                raise ValueError("n_iter must be >= 1")
+            normalized["param_distributions"] = param_distributions
+
+        return normalized
 
     def _load_training_data(
         self, source_path: Path
@@ -564,6 +715,25 @@ class XGBoostModel(Model):
                 }
 
         return rendering_status
+
+    def _to_json_compatible(self, value: Any) -> Any:
+        """Recursively convert values to strict JSON-compatible types."""
+        if isinstance(value, dict):
+            return {
+                str(key): self._to_json_compatible(val)
+                for key, val in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [self._to_json_compatible(item) for item in value]
+
+        if isinstance(value, np.generic):
+            return self._to_json_compatible(value.item())
+
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+
+        return value
 
     def _load_data(self, source_path: Path) -> tuple[np.ndarray, np.ndarray]:
         """Load feature matrix and label vector.

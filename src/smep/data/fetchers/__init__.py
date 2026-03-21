@@ -5,7 +5,7 @@ import logging
 
 from .fetcher import DataFetcher
 from .kaggle import KaggleDownloadError, KaggleFetcher
-from .mimic import MIMIC3Fetcher
+from .mimic import MIMIC3DemoFetcher, MIMIC310KFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,14 @@ class DataFetcherRegistry:
     def _register_builtin_fetchers(self) -> None:
         """Register the built-in data fetchers."""
         self.register(
-            name="mimic3",
-            description="MIMIC-III Clinical Database",
-            fetcher_class=MIMIC3Fetcher,
+            name="mimic3-demo",
+            description="MIMIC-III Clinical Database Demo",
+            fetcher_class=MIMIC3DemoFetcher,
+        )
+        self.register(
+            name="mimic3-10k",
+            description="MIMIC-III 10K Subset",
+            fetcher_class=MIMIC310KFetcher,
         )
 
     def register(
@@ -129,7 +134,8 @@ __all__ = [
     "DataFetcher",
     "KaggleFetcher",
     "KaggleDownloadError",
-    "MIMIC3Fetcher",
+    "MIMIC3DemoFetcher",
+    "MIMIC310KFetcher",
     "DataFetcherRegistry",
     "get_registry",
 ]
