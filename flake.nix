@@ -27,6 +27,7 @@
   outputs =
     {
       flake-parts,
+      nixpkgs,
       pyproject-nix,
       uv2nix,
       pyproject-build-systems,
@@ -36,8 +37,13 @@
       systems = [ "x86_64-linux" ];
 
       perSystem =
-        { pkgs, ... }:
+        { system, ... }:
         let
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
+
           python = pkgs.python314;
 
           py = import ./nix/python.nix {
@@ -78,7 +84,7 @@
                 uv
                 ruff
                 nixd
-                nixfmt-rfc-style
+                nixfmt
               ]);
             };
 

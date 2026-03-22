@@ -13,9 +13,10 @@ wheels/
 result
 result-*
 
-# Zed config files
+# IDE config files
 /.zed
 /.ropeproject
+/.vscode
 
 # Data files
 /.data
