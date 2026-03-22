@@ -5,6 +5,7 @@ import logging
 
 from .model import Model
 from .xgboost import XGBoostModel
+from .dnn import DNNModel
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,11 @@ class ModelRegistry:
             name="xgboost",
             description="XGBoost in-hospital mortality prediction for sepsis (MIMIC-III binary classification)",
             model_class=XGBoostModel,
+        )
+        self.register(
+            name="dnn",
+            description="PyTorch MLP+Attention in-hospital mortality prediction for sepsis (MIMIC-III binary classification)",
+            model_class=DNNModel,
         )
 
     def register(
@@ -126,6 +132,7 @@ def get_registry() -> ModelRegistry:
 __all__ = [
     "Model",
     "XGBoostModel",
+    "DNNModel",
     "ModelRegistry",
     "get_registry",
 ]
