@@ -83,7 +83,7 @@ class ModelConfig:
     input_dim: int = 0
     heads: int = 8
     key_dim: int = 64
-    epochs: int = 50
+    epochs: int = 100
     batch_size: int = 32
     lr: float = 1e-4
     patience: int = 10

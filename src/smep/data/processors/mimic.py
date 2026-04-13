@@ -32,6 +32,11 @@ class MIMIC3Processor(DataProcessor):
 
     # Available aggregation statistics
     VALID_AGG_STATS = {"mean", "max", "min", "std"}
+    TEMPORAL_FEATURE_CONFIG_PATH = (
+        Path(__file__).resolve().parent.parent
+        / "resources"
+        / "mimic_temporal_features.json"
+    )
 
     def __init__(
         self,
@@ -40,6 +45,9 @@ class MIMIC3Processor(DataProcessor):
         random_state: int = 42,
         stratify: bool = True,
         split_enabled: bool = True,
+        min_age: int = 15,
+        min_icu_hours: int = 12,
+        first_stay_only: bool = True,
     ):
         """Initialize the MIMIC3 processor.
 
@@ -51,6 +59,9 @@ class MIMIC3Processor(DataProcessor):
             random_state: Random seed used for reproducible splitting.
             stratify: Whether train/test split should be label-stratified.
             split_enabled: Whether to write train/test split files.
+            min_age: Minimum patient age in years for cohort inclusion.
+            min_icu_hours: Minimum ICU stay duration in hours.
+            first_stay_only: Whether to keep only the first ICU stay per subject.
         """
         if agg_stats is None:
             self.agg_stats = ["mean", "max", "min", "std"]
@@ -65,16 +76,28 @@ class MIMIC3Processor(DataProcessor):
 
         if not 0 < test_size < 1:
             raise ValueError("test_size must be between 0 and 1")
+        if min_age < 0:
+            raise ValueError("min_age must be non-negative")
+        if min_icu_hours <= 0:
+            raise ValueError("min_icu_hours must be positive")
 
         self.test_size = test_size
         self.random_state = random_state
         self.stratify = stratify
         self.split_enabled = split_enabled
+        self.min_age = min_age
+        self.min_icu_hours = min_icu_hours
+        self.first_stay_only = first_stay_only
+        self.temporal_feature_config_path = self.TEMPORAL_FEATURE_CONFIG_PATH
+        self.temporal_feature_config = self._load_temporal_feature_config()
 
         self.cohort_df: pd.DataFrame | None = None
         self.labels_df: pd.DataFrame | None = None
         self.static_features: pd.DataFrame | None = None
+        self.temporal_hourly: pd.DataFrame | None = None
         self.temporal_features: pd.DataFrame | None = None
+        self.merged_df: pd.DataFrame | None = None
+        self.filtered_df: pd.DataFrame | None = None
         self.full_df: pd.DataFrame | None = None
         self.train_df: pd.DataFrame | None = None
         self.test_df: pd.DataFrame | None = None
@@ -82,6 +105,11 @@ class MIMIC3Processor(DataProcessor):
         self.split_metadata: dict[str, object] = {}
         self.preprocessing_metadata: dict[str, object] = {}
         self.sample_filtering_metadata: dict[str, object] = {}
+        self.stage_metadata: dict[str, dict[str, object]] = {}
+        self.temporal_quality_metadata: dict[str, object] = {
+            "config_path": str(self.temporal_feature_config_path),
+            "sources": {},
+        }
 
     def process(self, source_path: Path, target_path: Path) -> None:
         """Process MIMIC-III data and generate ML-ready dataset.
@@ -119,11 +147,33 @@ class MIMIC3Processor(DataProcessor):
         logger.info("Processing complete!")
 
     def _filter_sepsis_cohort(self, source_path: Path) -> None:
-        """Filter patients with sepsis diagnosis."""
+        """Filter patients with sepsis diagnosis and ICU stay constraints."""
         diagnoses_path = source_path / "DIAGNOSES_ICD.csv"
+        icustays_path = source_path / "ICUSTAYS.csv"
+        admissions_path = source_path / "ADMISSIONS.csv"
+        patients_path = source_path / "PATIENTS.csv"
+
         diagnoses_df = self._read_csv_standard(
             diagnoses_path,
             required_columns=["subject_id", "hadm_id", "icd9_code"],
+        )
+        icustays_df = self._read_csv_standard(
+            icustays_path,
+            required_columns=[
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "intime",
+                "outtime",
+            ],
+        )
+        admissions_df = self._read_csv_standard(
+            admissions_path,
+            required_columns=["subject_id", "hadm_id", "admittime"],
+        )
+        patients_df = self._read_csv_standard(
+            patients_path,
+            required_columns=["subject_id", "dob"],
         )
 
         # Filter for sepsis ICD-9 codes (remove dots from codes)
@@ -133,11 +183,68 @@ class MIMIC3Processor(DataProcessor):
             .str.replace(".", "", regex=False)
             .isin(self.SEPSIS_ICD9_CODES)
         )
-        self.cohort_df = diagnoses_df[sepsis_mask][
+
+        sepsis_admissions = diagnoses_df[sepsis_mask][
             ["subject_id", "hadm_id"]
         ].drop_duplicates()
 
-        logger.info(f"Identified {len(self.cohort_df)} sepsis admissions")
+        icustays_df["intime"] = pd.to_datetime(icustays_df["intime"])
+        icustays_df["outtime"] = pd.to_datetime(icustays_df["outtime"])
+        admissions_df["admittime"] = pd.to_datetime(admissions_df["admittime"])
+        patients_df["dob"] = pd.to_datetime(patients_df["dob"])
+
+        cohort_df = sepsis_admissions.merge(
+            icustays_df,
+            on=["subject_id", "hadm_id"],
+            how="inner",
+        )
+        cohort_df = cohort_df.merge(
+            admissions_df[["subject_id", "hadm_id", "admittime"]],
+            on=["subject_id", "hadm_id"],
+            how="left",
+        )
+        cohort_df = cohort_df.merge(
+            patients_df[["subject_id", "dob"]],
+            on="subject_id",
+            how="left",
+        )
+
+        cohort_df["age"] = (
+            cohort_df["admittime"] - cohort_df["dob"]
+        ).dt.days / 365.25
+        cohort_df["icu_los_hours"] = (
+            cohort_df["outtime"] - cohort_df["intime"]
+        ).dt.total_seconds() / 3600
+
+        cohort_df = cohort_df[
+            (cohort_df["age"] >= self.min_age)
+            & (cohort_df["icu_los_hours"] >= self.min_icu_hours)
+        ].copy()
+
+        cohort_df = cohort_df.sort_values(
+            ["subject_id", "intime", "hadm_id", "icustay_id"]
+        )
+        if self.first_stay_only:
+            cohort_df = cohort_df.drop_duplicates(
+                subset=["subject_id"], keep="first"
+            )
+
+        self.cohort_df = cohort_df[
+            [
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "intime",
+                "outtime",
+                "age",
+                "icu_los_hours",
+            ]
+        ].drop_duplicates()
+
+        logger.info(
+            "Identified %s sepsis ICU stays after cohort filters",
+            len(self.cohort_df),
+        )
 
     def _extract_labels(self, source_path: Path) -> None:
         """Extract mortality labels."""
@@ -153,11 +260,12 @@ class MIMIC3Processor(DataProcessor):
         cohort_df = self._require_frame(self.cohort_df, "cohort_df")
 
         # Merge with cohort to get labels
-        self.labels_df = cohort_df.merge(
+        labels_df = cohort_df[["subject_id", "hadm_id", "icustay_id"]].merge(
             admissions_df[["subject_id", "hadm_id", "hospital_expire_flag"]],
             on=["subject_id", "hadm_id"],
             how="left",
         )
+        self.labels_df = labels_df
 
         logger.info(
             f"Mortality rate: {self.labels_df['hospital_expire_flag'].mean():.2%}"
@@ -167,6 +275,7 @@ class MIMIC3Processor(DataProcessor):
         """Extract static patient features."""
         patients_path = source_path / "PATIENTS.csv"
         admissions_path = source_path / "ADMISSIONS.csv"
+        icustays_path = source_path / "ICUSTAYS.csv"
 
         patients_df = self._read_csv_standard(
             patients_path,
@@ -179,10 +288,44 @@ class MIMIC3Processor(DataProcessor):
                 "hadm_id",
                 "admittime",
                 "admission_type",
+                "admission_location",
                 "insurance",
                 "ethnicity",
             ],
         )
+        icustays_df = self._read_csv_standard(
+            icustays_path,
+            required_columns=[
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "first_careunit",
+                "intime",
+            ],
+        )
+
+        admissions_df["admittime"] = pd.to_datetime(admissions_df["admittime"])
+        icustays_df["intime"] = pd.to_datetime(icustays_df["intime"])
+
+        admissions_df = admissions_df.sort_values(
+            ["subject_id", "admittime", "hadm_id"]
+        ).copy()
+        admissions_df["hospstay_seq"] = (
+            admissions_df.groupby("subject_id").cumcount() + 1
+        )
+        admissions_df["first_hosp_stay"] = (
+            admissions_df["hospstay_seq"] == 1
+        ).astype(int)
+
+        icustays_df = icustays_df.sort_values(
+            ["hadm_id", "intime", "icustay_id"]
+        ).copy()
+        icustays_df["icustay_seq"] = (
+            icustays_df.groupby("hadm_id").cumcount() + 1
+        )
+        icustays_df["first_icu_stay"] = (
+            icustays_df["icustay_seq"] == 1
+        ).astype(int)
 
         # Merge with cohort
         static_df = self._require_frame(self.cohort_df, "cohort_df").copy()
@@ -202,15 +345,32 @@ class MIMIC3Processor(DataProcessor):
                     "hadm_id",
                     "admittime",
                     "admission_type",
+                    "admission_location",
                     "insurance",
                     "ethnicity",
+                    "hospstay_seq",
+                    "first_hosp_stay",
                 ]
             ],
             on=["subject_id", "hadm_id"],
             how="left",
         )
+        static_df = static_df.merge(
+            icustays_df[
+                [
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    "first_careunit",
+                    "icustay_seq",
+                    "first_icu_stay",
+                ]
+            ],
+            on=["subject_id", "hadm_id", "icustay_id"],
+            how="left",
+        )
 
-        # Calculate age
+        # Calculate age only if cohort did not already provide it
         static_df["dob"] = pd.to_datetime(static_df["dob"])
         static_df["admittime"] = pd.to_datetime(static_df["admittime"])
         static_df["age"] = (
@@ -223,220 +383,428 @@ class MIMIC3Processor(DataProcessor):
         # One-hot encode admission type, insurance, ethnicity
         static_df = pd.get_dummies(
             static_df,
-            columns=["admission_type", "insurance", "ethnicity"],
-            prefix=["admit", "ins", "eth"],
+            columns=[
+                "admission_type",
+                "admission_location",
+                "insurance",
+                "ethnicity",
+                "first_careunit",
+            ],
+            prefix=["admit", "admit_loc", "ins", "eth", "careunit"],
         )
 
         # Select final static features
-        feature_cols = ["subject_id", "hadm_id", "age", "gender_m"] + [
+        feature_cols = [
+            "subject_id",
+            "hadm_id",
+            "icustay_id",
+            "age",
+            "gender_m",
+            "hospstay_seq",
+            "icustay_seq",
+            "first_hosp_stay",
+            "first_icu_stay",
+        ] + [
             col
             for col in static_df.columns
-            if col.startswith(("admit_", "ins_", "eth_"))
+            if col.startswith(
+                ("admit_", "admit_loc_", "ins_", "eth_", "careunit_")
+            )
         ]
         self.static_features = static_df[feature_cols]
 
-        logger.info(f"Extracted {len(feature_cols) - 2} static features")
+        logger.info(f"Extracted {len(feature_cols) - 3} static features")
 
     def _extract_temporal_features(self, source_path: Path) -> None:
-        """Extract and aggregate temporal features from chart events and lab events."""
-        # Get ICU stay times
-        icustays_path = source_path / "ICUSTAYS.csv"
-        icustays_df = self._read_csv_standard(
-            icustays_path,
-            required_columns=[
-                "subject_id",
-                "hadm_id",
-                "icustay_id",
-                "intime",
-                "outtime",
-            ],
-        )
-        icustays_df["intime"] = pd.to_datetime(icustays_df["intime"])
-        icustays_df["outtime"] = pd.to_datetime(icustays_df["outtime"])
+        """Extract hourly temporal features, then aggregate them for tabular export."""
+        icu_cohort = self._require_frame(self.cohort_df, "cohort_df").copy()
 
-        # Merge with cohort
-        icu_cohort = self._require_frame(self.cohort_df, "cohort_df").merge(
-            icustays_df[["subject_id", "hadm_id", "icustay_id", "intime"]],
-            on=["subject_id", "hadm_id"],
-            how="left",
+        chart_hourly = self._extract_chartevents(source_path, icu_cohort)
+        lab_hourly = self._extract_labevents(source_path, icu_cohort)
+
+        temporal_hourly = pd.concat(
+            [chart_hourly, lab_hourly], axis=0, ignore_index=True
         )
 
-        # Extract chart events (vital signs)
-        temporal_features = self._extract_chartevents(source_path, icu_cohort)
+        if temporal_hourly.empty:
+            self.temporal_hourly = pd.DataFrame(
+                columns=[
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    "hours_in",
+                    "feature_name",
+                    "value_mean",
+                    "value_count",
+                    "value_std",
+                ]
+            )
+        else:
+            self.temporal_hourly = (
+                temporal_hourly.groupby(
+                    [
+                        "subject_id",
+                        "hadm_id",
+                        "icustay_id",
+                        "hours_in",
+                        "feature_name",
+                    ],
+                    as_index=False,
+                )["valuenum"]
+                .agg(["mean", "count", "std"])
+                .reset_index()
+                .rename(
+                    columns={
+                        "mean": "value_mean",
+                        "count": "value_count",
+                        "std": "value_std",
+                    }
+                )
+            )
+            self.temporal_hourly["value_std"] = self.temporal_hourly[
+                "value_std"
+            ].fillna(0.0)
+            self.temporal_hourly = self.temporal_hourly.sort_values(
+                [
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    "hours_in",
+                    "feature_name",
+                ]
+            ).reset_index(drop=True)
 
-        # Extract lab events
-        lab_features = self._extract_labevents(source_path, icu_cohort)
-
-        # Merge temporal and lab features
-        self.temporal_features = temporal_features.merge(
-            lab_features, on=["subject_id", "hadm_id"], how="outer"
+        self.temporal_features = self._aggregate_temporal_features(
+            icu_cohort,
+            self._require_frame(self.temporal_hourly, "temporal_hourly"),
         )
 
         logger.info(
-            f"Extracted {len(self.temporal_features.columns) - 2} temporal features"
+            "Extracted %s hourly rows and %s aggregated temporal features",
+            len(self.temporal_hourly),
+            len(self.temporal_features.columns) - 3,
         )
 
     def _extract_chartevents(
         self, source_path: Path, icu_cohort: pd.DataFrame
     ) -> pd.DataFrame:
-        """Extract vital signs from CHARTEVENTS."""
+        """Extract hourly vital-sign rows from CHARTEVENTS."""
         chartevents_path = source_path / "CHARTEVENTS.csv"
-
-        # Define vital sign item IDs (common MIMIC-III item IDs)
-        vital_items = {
-            "HR": [211, 220045],  # Heart Rate
-            "SysBP": [51, 442, 455, 6701, 220179, 220050],  # Systolic BP
-            "DiasBP": [8368, 8440, 8441, 8555, 220180, 220051],  # Diastolic BP
-            "Temp": [223761, 678],  # Temperature
-            "RR": [618, 615, 220210, 224690],  # Respiratory Rate
-            "SpO2": [646, 220277],  # Oxygen Saturation
-        }
-
-        # Collect all cohort rows from all chunks before aggregating to avoid
-        # duplicate columns caused by per-chunk partial aggregations.
-        raw_rows: list[pd.DataFrame] = []
-
-        try:
-            for chunk in self._read_csv_chunks_standard(
-                chartevents_path,
-                chunksize=100000,
-                required_columns=[
-                    "subject_id",
-                    "hadm_id",
-                    "charttime",
-                    "itemid",
-                    "valuenum",
-                ],
-            ):
-                chunk["charttime"] = pd.to_datetime(chunk["charttime"])
-
-                # Filter for cohort and time window
-                chunk = chunk.merge(
-                    icu_cohort[["subject_id", "hadm_id", "intime"]],
-                    on=["subject_id", "hadm_id"],
-                    how="inner",
-                )
-                chunk = chunk[
-                    (chunk["charttime"] >= chunk["intime"])
-                    & (
-                        chunk["charttime"]
-                        <= chunk["intime"]
-                        + pd.Timedelta(hours=self.TIME_WINDOW_HOURS)
-                    )
-                ]
-                if not chunk.empty:
-                    raw_rows.append(
-                        chunk[["subject_id", "hadm_id", "itemid", "valuenum"]]
-                    )
-        except Exception as e:
-            logger.warning(
-                f"Error processing CHARTEVENTS: {e}. Using empty features."
-            )
-
-        if not raw_rows:
-            return icu_cohort[["subject_id", "hadm_id"]].copy()
-
-        all_data = pd.concat(raw_rows, axis=0)
-        aggregated_features: list[pd.DataFrame] = []
-        for vital_name, item_ids in vital_items.items():
-            vital_data = all_data[all_data["itemid"].isin(item_ids)]
-            if not vital_data.empty:
-                agg = vital_data.groupby(["subject_id", "hadm_id"])[
-                    "valuenum"
-                ].agg([(stat, stat) for stat in self.agg_stats])
-                agg.columns = [
-                    f"{vital_name}_{stat}" for stat in self.agg_stats
-                ]
-                aggregated_features.append(agg)
-
-        if aggregated_features:
-            result = pd.concat(aggregated_features, axis=1).reset_index()
-        else:
-            result = icu_cohort[["subject_id", "hadm_id"]].copy()
-
-        return result
+        return self._extract_hourly_measurements(
+            file_path=chartevents_path,
+            icu_cohort=icu_cohort,
+            feature_specs=self._get_temporal_feature_specs("chartevents"),
+            include_icustay_id=True,
+            source_name="chartevents",
+        )
 
     def _extract_labevents(
         self, source_path: Path, icu_cohort: pd.DataFrame
     ) -> pd.DataFrame:
-        """Extract lab values from LABEVENTS."""
+        """Extract hourly lab rows from LABEVENTS."""
         labevents_path = source_path / "LABEVENTS.csv"
+        return self._extract_hourly_measurements(
+            file_path=labevents_path,
+            icu_cohort=icu_cohort,
+            feature_specs=self._get_temporal_feature_specs("labevents"),
+            include_icustay_id=False,
+            source_name="labevents",
+        )
 
-        # Define lab item labels to extract
-        lab_items = {
-            "Creatinine": [50912],
-            "Platelet": [51265],
-            "WBC": [51300, 51301],
-            "Hemoglobin": [51222],
-            "Sodium": [50824, 50983],
-            "Potassium": [50822, 50971],
-            "Chloride": [50806, 50902],
+    def _extract_hourly_measurements(
+        self,
+        file_path: Path,
+        icu_cohort: pd.DataFrame,
+        feature_specs: dict[str, dict[str, Any]],
+        include_icustay_id: bool,
+        source_name: str,
+    ) -> pd.DataFrame:
+        """Extract hourly long-format rows for a temporal source table."""
+        item_lookup = {
+            item_id: feature_name
+            for feature_name, feature_spec in feature_specs.items()
+            for item_id in feature_spec.get("itemids", [])
         }
+        required_columns = [
+            "subject_id",
+            "hadm_id",
+            "charttime",
+            "itemid",
+            "valuenum",
+        ]
+        if include_icustay_id:
+            required_columns.insert(2, "icustay_id")
 
         raw_rows: list[pd.DataFrame] = []
+        cohort_columns = [
+            "subject_id",
+            "hadm_id",
+            "icustay_id",
+            "intime",
+            "outtime",
+        ]
+        merge_keys = ["subject_id", "hadm_id", "icustay_id"]
+        if not include_icustay_id:
+            merge_keys = ["subject_id", "hadm_id"]
 
         try:
             for chunk in self._read_csv_chunks_standard(
-                labevents_path,
+                file_path,
                 chunksize=100000,
-                required_columns=[
-                    "subject_id",
-                    "hadm_id",
-                    "charttime",
-                    "itemid",
-                    "valuenum",
-                ],
+                required_columns=required_columns,
             ):
                 chunk["charttime"] = pd.to_datetime(chunk["charttime"])
+                chunk["itemid"] = pd.to_numeric(
+                    chunk["itemid"], errors="coerce"
+                )
+                chunk["valuenum"] = pd.to_numeric(
+                    chunk["valuenum"], errors="coerce"
+                ).astype(float)
+                chunk = chunk[chunk["itemid"].isin(item_lookup)]
+                if chunk.empty:
+                    continue
 
-                # Filter for cohort and time window
                 chunk = chunk.merge(
-                    icu_cohort[["subject_id", "hadm_id", "intime"]],
-                    on=["subject_id", "hadm_id"],
+                    icu_cohort[cohort_columns],
+                    on=merge_keys,
                     how="inner",
                 )
+                if chunk.empty:
+                    continue
+
+                window_end = chunk["intime"] + pd.Timedelta(
+                    hours=self.TIME_WINDOW_HOURS
+                )
+                chunk_window_end = pd.concat(
+                    [window_end, chunk["outtime"]], axis=1
+                ).min(axis=1)
                 chunk = chunk[
-                    (chunk["charttime"] >= chunk["intime"])
-                    & (
-                        chunk["charttime"]
-                        <= chunk["intime"]
-                        + pd.Timedelta(hours=self.TIME_WINDOW_HOURS)
-                    )
-                ]
-                if not chunk.empty:
-                    raw_rows.append(
-                        chunk[["subject_id", "hadm_id", "itemid", "valuenum"]]
-                    )
-        except Exception as e:
+                    chunk["valuenum"].notna()
+                    & (chunk["charttime"] >= chunk["intime"])
+                    & (chunk["charttime"] <= chunk_window_end)
+                ].copy()
+                if chunk.empty:
+                    continue
+
+                chunk["hours_in"] = (
+                    (chunk["charttime"] - chunk["intime"]).dt.total_seconds()
+                    // 3600
+                ).astype(int)
+                chunk["feature_name"] = chunk["itemid"].map(item_lookup)
+                chunk = self._apply_quality_rules(
+                    chunk,
+                    feature_specs=feature_specs,
+                    source_name=source_name,
+                )
+                if chunk.empty:
+                    continue
+                raw_rows.append(
+                    chunk[
+                        [
+                            "subject_id",
+                            "hadm_id",
+                            "icustay_id",
+                            "hours_in",
+                            "feature_name",
+                            "valuenum",
+                        ]
+                    ]
+                )
+        except Exception as error:
             logger.warning(
-                f"Error processing LABEVENTS: {e}. Using empty features."
+                "Error processing %s: %s. Using empty hourly features.",
+                file_path.name,
+                error,
             )
 
         if not raw_rows:
-            return icu_cohort[["subject_id", "hadm_id"]].copy()
+            return pd.DataFrame(
+                columns=[
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    "hours_in",
+                    "feature_name",
+                    "valuenum",
+                ]
+            )
 
-        all_data = pd.concat(raw_rows, axis=0)
-        aggregated_features: list[pd.DataFrame] = []
-        for lab_name, item_ids in lab_items.items():
-            lab_data = all_data[all_data["itemid"].isin(item_ids)]
-            if not lab_data.empty:
-                agg = lab_data.groupby(["subject_id", "hadm_id"])[
-                    "valuenum"
-                ].agg([(stat, stat) for stat in self.agg_stats])
-                agg.columns = [f"{lab_name}_{stat}" for stat in self.agg_stats]
-                aggregated_features.append(agg)
+        return pd.concat(raw_rows, axis=0, ignore_index=True)
 
-        if aggregated_features:
-            result = pd.concat(aggregated_features, axis=1).reset_index()
-        else:
-            result = icu_cohort[["subject_id", "hadm_id"]].copy()
+    def _load_temporal_feature_config(self) -> dict[str, dict[str, Any]]:
+        """Load external temporal feature mapping and quality rules."""
+        if not self.temporal_feature_config_path.exists():
+            raise FileNotFoundError(
+                "Temporal feature configuration file not found: "
+                f"{self.temporal_feature_config_path}"
+            )
 
-        return result
+        with self.temporal_feature_config_path.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                "Temporal feature configuration must be a JSON object"
+            )
+
+        return cast(dict[str, dict[str, Any]], loaded)
+
+    def _get_temporal_feature_specs(
+        self, source_name: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return configured temporal feature specs for a source table."""
+        source_config = self.temporal_feature_config.get(source_name, {})
+        if not isinstance(source_config, dict):
+            raise ValueError(
+                f"Temporal feature config for {source_name} must be an object"
+            )
+        return cast(dict[str, dict[str, Any]], source_config)
+
+    def _apply_quality_rules(
+        self,
+        chunk: pd.DataFrame,
+        feature_specs: dict[str, dict[str, Any]],
+        source_name: str,
+    ) -> pd.DataFrame:
+        """Apply unit normalization and range checks to hourly rows."""
+        cleaned = chunk.copy()
+        if "valueuom" not in cleaned.columns:
+            cleaned["valueuom"] = ""
+        cleaned["valueuom"] = (
+            cleaned["valueuom"].fillna("").astype(str).str.strip().str.lower()
+        )
+
+        converted_rows = 0
+        clipped_rows = 0
+        dropped_rows = 0
+
+        for feature_name, feature_spec in feature_specs.items():
+            feature_mask = cleaned["feature_name"] == feature_name
+            if not feature_mask.any():
+                continue
+
+            for conversion in feature_spec.get("unit_conversions", []):
+                conversion_kind = conversion.get("kind")
+                conversion_units = {
+                    str(unit).strip().lower()
+                    for unit in conversion.get("units", [])
+                }
+                conversion_mask = feature_mask & cleaned["valueuom"].isin(
+                    conversion_units
+                )
+                if conversion.get("infer_if_above_one"):
+                    conversion_mask = conversion_mask | (
+                        feature_mask & (cleaned["valuenum"] > 1)
+                    )
+                if not conversion_mask.any():
+                    continue
+
+                if conversion_kind == "fahrenheit_to_celsius":
+                    cleaned.loc[conversion_mask, "valuenum"] = (
+                        cleaned.loc[conversion_mask, "valuenum"] - 32.0
+                    ) * (5.0 / 9.0)
+                    converted_rows += int(conversion_mask.sum())
+                elif conversion_kind == "percent_to_fraction":
+                    cleaned.loc[conversion_mask, "valuenum"] = (
+                        cleaned.loc[conversion_mask, "valuenum"] / 100.0
+                    )
+                    converted_rows += int(conversion_mask.sum())
+
+            valid_min = feature_spec.get("valid_min")
+            valid_max = feature_spec.get("valid_max")
+            out_of_range = str(feature_spec.get("out_of_range", "drop"))
+
+            if valid_min is not None:
+                low_mask = feature_mask & (cleaned["valuenum"] < valid_min)
+                if low_mask.any():
+                    if out_of_range == "clip":
+                        cleaned.loc[low_mask, "valuenum"] = valid_min
+                        clipped_rows += int(low_mask.sum())
+                    else:
+                        cleaned.loc[low_mask, "valuenum"] = float("nan")
+
+            if valid_max is not None:
+                high_mask = feature_mask & (cleaned["valuenum"] > valid_max)
+                if high_mask.any():
+                    if out_of_range == "clip":
+                        cleaned.loc[high_mask, "valuenum"] = valid_max
+                        clipped_rows += int(high_mask.sum())
+                    else:
+                        cleaned.loc[high_mask, "valuenum"] = float("nan")
+
+        valid_mask = cleaned["valuenum"].notna()
+        dropped_rows += int((~valid_mask).sum())
+        self._update_quality_metadata(
+            source_name,
+            rows_seen=len(cleaned),
+            rows_kept=int(valid_mask.sum()),
+            rows_dropped=dropped_rows,
+            unit_converted=converted_rows,
+            clipped=clipped_rows,
+        )
+        return cleaned.loc[valid_mask].copy()
+
+    def _update_quality_metadata(
+        self,
+        source_name: str,
+        rows_seen: int,
+        rows_kept: int,
+        rows_dropped: int,
+        unit_converted: int,
+        clipped: int,
+    ) -> None:
+        """Accumulate temporal data quality statistics by source."""
+        sources = cast(
+            dict[str, dict[str, int]], self.temporal_quality_metadata["sources"]
+        )
+        source_stats = sources.setdefault(
+            source_name,
+            {
+                "rows_seen": 0,
+                "rows_kept": 0,
+                "rows_dropped": 0,
+                "unit_converted": 0,
+                "clipped": 0,
+            },
+        )
+        source_stats["rows_seen"] += rows_seen
+        source_stats["rows_kept"] += rows_kept
+        source_stats["rows_dropped"] += rows_dropped
+        source_stats["unit_converted"] += unit_converted
+        source_stats["clipped"] += clipped
+
+    def _aggregate_temporal_features(
+        self, icu_cohort: pd.DataFrame, temporal_hourly: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Aggregate hourly rows into per-stay tabular features."""
+        key_columns = ["subject_id", "hadm_id", "icustay_id"]
+        base = icu_cohort[key_columns].drop_duplicates().copy()
+
+        if temporal_hourly.empty:
+            return base
+
+        aggregated = (
+            temporal_hourly.groupby(key_columns + ["feature_name"])[
+                "value_mean"
+            ]
+            .agg(self.agg_stats)
+            .unstack("feature_name")
+        )
+        aggregated.columns = [
+            f"{feature_name}_{stat}"
+            for stat, feature_name in aggregated.columns.to_flat_index()
+        ]
+        aggregated = aggregated.reset_index()
+
+        return base.merge(aggregated, on=key_columns, how="left")
 
     def _clean_and_aggregate(self) -> None:
         """Clean data and merge all features."""
         merged_df = self._build_merged_dataset()
         filtered_df = self._filter_sparse_samples(merged_df)
+
+        self.merged_df = merged_df.copy()
+        self.filtered_df = filtered_df.copy()
 
         if filtered_df.empty:
             raise ValueError("No samples remaining after sample filtering")
@@ -471,8 +839,14 @@ class MIMIC3Processor(DataProcessor):
         )
 
         merged_df = labels_df.merge(
-            static_features, on=["subject_id", "hadm_id"], how="left"
-        ).merge(temporal_features, on=["subject_id", "hadm_id"], how="left")
+            static_features,
+            on=["subject_id", "hadm_id", "icustay_id"],
+            how="left",
+        ).merge(
+            temporal_features,
+            on=["subject_id", "hadm_id", "icustay_id"],
+            how="left",
+        )
 
         logger.info(f"Merged data shape: {merged_df.shape}")
         return merged_df
@@ -648,11 +1022,19 @@ class MIMIC3Processor(DataProcessor):
 
     def _save_output(self, target_path: Path) -> None:
         """Save processed data to target directory."""
+        self._save_stage_outputs(target_path)
+
         full_df = self._require_frame(self.full_df, "full_df")
         train_df = self._require_frame(self.train_df, "train_df")
 
         full_features = full_df.drop(columns=["hospital_expire_flag"])
         full_labels = full_df["hospital_expire_flag"]
+
+        processed_dataset = full_df.copy()
+        processed_dataset.to_csv(
+            target_path / "processed_dataset.csv", index=False
+        )
+        self._record_stage_metadata("processed_dataset", processed_dataset)
 
         if self.split_enabled:
             test_df = self._require_frame(self.test_df, "test_df")
@@ -704,6 +1086,20 @@ class MIMIC3Processor(DataProcessor):
             "processing_date": datetime.now().isoformat(),
             "time_window_hours": self.TIME_WINDOW_HOURS,
             "sepsis_codes": self.SEPSIS_ICD9_CODES,
+            "cohort_rules": {
+                "min_age": self.min_age,
+                "min_icu_hours": self.min_icu_hours,
+                "first_stay_only": self.first_stay_only,
+            },
+            "temporal_feature_config": {
+                "path": str(self.temporal_feature_config_path),
+                "sources": {
+                    source_name: list(source_specs.keys())
+                    for source_name, source_specs in self.temporal_feature_config.items()
+                },
+            },
+            "temporal_quality": self.temporal_quality_metadata,
+            "stage_outputs": self.stage_metadata,
             "sample_filtering": self.sample_filtering_metadata,
             "split": self.split_metadata,
             "preprocessing": self.preprocessing_metadata,
@@ -713,12 +1109,53 @@ class MIMIC3Processor(DataProcessor):
             json.dump(metadata, f, indent=2)
         logger.info("Saved metadata")
 
+    def _save_stage_outputs(self, target_path: Path) -> None:
+        """Persist stage-level datasets for debugging and reuse."""
+        stage_frames = {
+            "cohort": self._require_frame(self.cohort_df, "cohort_df"),
+            "labels": self._require_frame(self.labels_df, "labels_df"),
+            "static_features": self._require_frame(
+                self.static_features, "static_features"
+            ),
+            "temporal_hourly": self._require_frame(
+                self.temporal_hourly, "temporal_hourly"
+            ),
+            "temporal_features": self._require_frame(
+                self.temporal_features, "temporal_features"
+            ),
+            "merged_dataset": self._require_frame(self.merged_df, "merged_df"),
+            "filtered_dataset": self._require_frame(
+                self.filtered_df, "filtered_df"
+            ),
+        }
+
+        for stage_name, frame in stage_frames.items():
+            output_path = target_path / f"{stage_name}.csv"
+            frame.to_csv(output_path, index=False)
+            self._record_stage_metadata(stage_name, frame)
+
+        logger.info("Saved %s stage-level datasets", len(stage_frames))
+
+    def _record_stage_metadata(self, stage_name: str, df: pd.DataFrame) -> None:
+        """Record a compact summary for a stage output."""
+        self.stage_metadata[stage_name] = {
+            "rows": int(df.shape[0]),
+            "columns": int(df.shape[1]),
+            "column_names": list(df.columns),
+        }
+
     def _get_feature_columns(self, df: pd.DataFrame) -> list[str]:
         """Return model feature columns excluding identifiers and labels."""
         return [
             column
             for column in df.columns
-            if column not in {"subject_id", "hadm_id", "hospital_expire_flag"}
+            if column
+            not in {
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "hospital_expire_flag",
+            }
         ]
 
     def _read_csv_standard(

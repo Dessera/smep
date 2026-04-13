@@ -177,6 +177,21 @@ def process(
         "--split/--no-split",
         help="Generate train/test split files alongside the full dataset.",
     ),
+    min_age: int = typer.Option(
+        15,
+        "--min-age",
+        help="Minimum patient age in years for cohort inclusion.",
+    ),
+    min_icu_hours: int = typer.Option(
+        12,
+        "--min-icu-hours",
+        help="Minimum ICU stay duration in hours for cohort inclusion.",
+    ),
+    first_stay_only: bool = typer.Option(
+        True,
+        "--first-stay-only/--all-stays",
+        help="Keep only the first ICU stay per subject.",
+    ),
 ) -> None:
     """Process data using a specified processor.
 
@@ -210,6 +225,9 @@ def process(
                 random_state=random_state,
                 stratify=stratify,
                 split_enabled=split_enabled,
+                min_age=min_age,
+                min_icu_hours=min_icu_hours,
+                first_stay_only=first_stay_only,
             )
         except (KeyError, ValueError) as e:
             typer.echo(f"Error: {e}", err=True)
@@ -221,6 +239,9 @@ def process(
         typer.echo(f"Output directory: {output}")
         typer.echo(f"Aggregation statistics: {', '.join(resolved_agg_stats)}")
         typer.echo(f"Train/test split enabled: {split_enabled}")
+        typer.echo(f"Minimum age: {min_age}")
+        typer.echo(f"Minimum ICU hours: {min_icu_hours}")
+        typer.echo(f"First ICU stay only: {first_stay_only}")
         if split_enabled:
             typer.echo(f"Test split ratio: {test_size}")
             typer.echo(f"Random seed: {random_state}")
