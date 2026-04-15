@@ -71,8 +71,10 @@ class XGBoostModel(Model):
         )
 
         scale_pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+        use_early_stopping = X_val is not None and y_val is not None
+
         base_classifier = XGBClassifier(
-            n_estimators=200,
+            n_estimators=1000 if use_early_stopping else 200,
             max_depth=4,
             learning_rate=0.05,
             subsample=0.8,
@@ -84,6 +86,7 @@ class XGBoostModel(Model):
             scale_pos_weight=float(scale_pos_weight),
             use_label_encoder=False,
             eval_metric="logloss",
+            early_stopping_rounds=50 if use_early_stopping else None,
             random_state=42,
             n_jobs=-1,
         )
@@ -101,10 +104,19 @@ class XGBoostModel(Model):
         }
 
         strategy = tuning_config["strategy"]
+        fit_params: dict[str, Any] = {"verbose": False}
+        if use_early_stopping:
+            fit_params["eval_set"] = [(X_val, y_val)]
+
         if strategy == "none":
             self._classifier = base_classifier
-            self._classifier.fit(X_train, y_train)
+            self._classifier.fit(X_train, y_train, **fit_params)
         elif strategy == "grid":
+            # Don't pass eval_set into CV — it leaks validation data into
+            # each fold.  Early stopping is only used in strategy=none.
+            base_classifier.set_params(
+                n_estimators=200, early_stopping_rounds=None
+            )
             search = GridSearchCV(
                 estimator=base_classifier,
                 param_grid=tuning_config["param_grid"],
@@ -123,6 +135,9 @@ class XGBoostModel(Model):
                 cast(dict[str, Any], search.cv_results_)["params"]
             )
         else:
+            base_classifier.set_params(
+                n_estimators=200, early_stopping_rounds=None
+            )
             search = RandomizedSearchCV(
                 estimator=base_classifier,
                 param_distributions=tuning_config["param_distributions"],

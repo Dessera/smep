@@ -9,7 +9,9 @@ from .dnn import DNNModel
 from .data_loader import TrainingData, load_training_data
 from .evaluator import (
     EvaluationResult,
+    ThresholdResult,
     evaluate,
+    find_optimal_threshold,
     compute_curve_points,
     render_curves,
     write_evaluation_outputs,
@@ -159,7 +161,9 @@ __all__ = [
     "TrainingData",
     "load_training_data",
     "EvaluationResult",
+    "ThresholdResult",
     "evaluate",
+    "find_optimal_threshold",
     "compute_curve_points",
     "render_curves",
     "write_evaluation_outputs",

@@ -12,6 +12,7 @@ from smep.models.data_loader import load_training_data
 from smep.models.evaluator import (
     evaluate,
     compute_curve_points,
+    find_optimal_threshold,
     write_evaluation_outputs,
     _to_json_compatible,
 )
@@ -59,7 +60,7 @@ def train(
         help="Scoring metric used by tuning search.",
     ),
     n_iter: int = typer.Option(
-        30,
+        100,
         "--n-iter",
         help="Number of sampled candidates when strategy is random.",
     ),
@@ -67,6 +68,11 @@ def train(
         None,
         "--param-space",
         help="JSON file containing param_grid or param_distributions.",
+    ),
+    threshold_strategy: str = typer.Option(
+        "none",
+        "--threshold-strategy",
+        help="Threshold optimisation strategy on validation set: none (use 0.5), youden, or f1.",
     ),
 ) -> None:
     """Train the specified model on build artifacts and write outputs.
@@ -183,18 +189,60 @@ def train(
             logger.exception("Unexpected error during training")
             raise typer.Exit(code=1)
 
-        # 3. Evaluate on all three splits
+        # 3. Threshold tuning on validation set
+        threshold_strategy_clean = threshold_strategy.strip().lower()
+        valid_threshold_strategies = {"none", "youden", "f1"}
+        if threshold_strategy_clean not in valid_threshold_strategies:
+            typer.echo(
+                "Error: --threshold-strategy must be one of: none, youden, f1",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        threshold = 0.5
+        threshold_info: dict[str, Any] = {
+            "strategy": threshold_strategy_clean,
+            "threshold": 0.5,
+            "metric_value": None,
+        }
+        if threshold_strategy_clean != "none":
+            val_proba = model_instance.predict_proba(data.X_val)
+            thr_result = find_optimal_threshold(
+                data.y_val, val_proba, strategy=threshold_strategy_clean
+            )
+            threshold = thr_result.threshold
+            threshold_info = {
+                "strategy": thr_result.strategy,
+                "threshold": thr_result.threshold,
+                "metric_value": thr_result.metric_value,
+            }
+            typer.echo(
+                f"Optimal threshold ({thr_result.strategy}): "
+                f"{thr_result.threshold:.4f} "
+                f"(metric={thr_result.metric_value:.4f})"
+            )
+
+        # 4. Evaluate on all three splits
         train_result = evaluate(
-            data.y_train, model_instance.predict_proba(data.X_train), "train"
+            data.y_train,
+            model_instance.predict_proba(data.X_train),
+            "train",
+            threshold=threshold,
         )
         val_result = evaluate(
-            data.y_val, model_instance.predict_proba(data.X_val), "val"
+            data.y_val,
+            model_instance.predict_proba(data.X_val),
+            "val",
+            threshold=threshold,
         )
         test_result = evaluate(
-            data.y_test, model_instance.predict_proba(data.X_test), "test"
+            data.y_test,
+            model_instance.predict_proba(data.X_test),
+            "test",
+            threshold=threshold,
         )
 
-        # 4. Save model weights
+        # 5. Save model weights
         try:
             model_meta = model_instance.save(output)
         except RuntimeError as e:
@@ -205,11 +253,11 @@ def train(
             logger.exception("Unexpected error during save")
             raise typer.Exit(code=1)
 
-        # 5. Write feature names
+        # 6. Write feature names
         feature_file = output / "feature_names.txt"
         feature_file.write_text("\n".join(data.feature_names), encoding="utf-8")
 
-        # 6. Write evaluation outputs
+        # 7. Write evaluation outputs
         curve_points = compute_curve_points(
             data.y_test, model_instance.predict_proba(data.X_test)
         )
@@ -217,7 +265,7 @@ def train(
             output, train_result, val_result, test_result, curve_points
         )
 
-        # 7. Write metadata
+        # 8. Write metadata
         metadata: dict[str, Any] = {
             "model": model,
             "model_file": model_meta.get("model_file"),
@@ -228,6 +276,7 @@ def train(
                 "cv": cv,
                 "scoring": scoring,
             },
+            "threshold": threshold_info,
             "tuning_summary": model_meta.get(
                 "tuning_summary",
                 {

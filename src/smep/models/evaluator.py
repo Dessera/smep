@@ -32,6 +32,15 @@ _PR_PLOT_FILE = "pr_curve.png"
 
 
 @dataclass
+class ThresholdResult:
+    """Result of threshold optimization."""
+
+    strategy: str
+    threshold: float
+    metric_value: float
+
+
+@dataclass
 class EvaluationResult:
     """Evaluation metrics for a single data split."""
 
@@ -45,12 +54,65 @@ class EvaluationResult:
     pr_auc: float | None
     confusion_matrix: list[list[int]]
     positive_rate: float
+    threshold: float
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    strategy: str = "youden",
+) -> ThresholdResult:
+    """Find optimal classification threshold on validation data.
+
+    Args:
+        y_true: Ground truth labels (0/1).
+        y_prob: Predicted positive-class probabilities.
+        strategy: Optimization strategy.
+            - ``youden``: maximise Youden's J = TPR - FPR (best ROC operating point).
+            - ``f1``: maximise F1-score across thresholds.
+
+    Returns:
+        ThresholdResult with selected threshold and the metric value at that point.
+
+    Raises:
+        ValueError: If strategy is unknown or threshold search fails.
+    """
+    if strategy == "youden":
+        fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+        j_scores = tpr - fpr
+        best_idx = int(np.argmax(j_scores))
+        return ThresholdResult(
+            strategy="youden",
+            threshold=float(thresholds[best_idx]),
+            metric_value=float(j_scores[best_idx]),
+        )
+
+    if strategy == "f1":
+        prec_arr, rec_arr, thresholds = precision_recall_curve(y_true, y_prob)
+        # precision_recall_curve returns n+1 precision/recall but n thresholds
+        f1_scores = (
+            2
+            * prec_arr[:-1]
+            * rec_arr[:-1]
+            / (prec_arr[:-1] + rec_arr[:-1] + 1e-12)
+        )
+        best_idx = int(np.argmax(f1_scores))
+        return ThresholdResult(
+            strategy="f1",
+            threshold=float(thresholds[best_idx]),
+            metric_value=float(f1_scores[best_idx]),
+        )
+
+    raise ValueError(
+        f"Unknown threshold strategy '{strategy}'. Expected one of: youden, f1"
+    )
 
 
 def evaluate(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     split: str,
+    threshold: float = 0.5,
 ) -> EvaluationResult:
     """Compute binary classification evaluation metrics.
 
@@ -58,11 +120,12 @@ def evaluate(
         y_true: Ground truth labels (0/1).
         y_prob: Predicted positive-class probabilities.
         split: Name of the data split (e.g. "train", "val", "test").
+        threshold: Classification threshold (default 0.5).
 
     Returns:
         EvaluationResult with all computed metrics.
     """
-    y_pred = (y_prob >= 0.5).astype(np.int32)
+    y_pred = (y_prob >= threshold).astype(np.int32)
 
     acc = float(accuracy_score(y_true, y_pred))
     prec = float(precision_score(y_true, y_pred, zero_division=0))
@@ -101,6 +164,7 @@ def evaluate(
         pr_auc=pr_auc_val,
         confusion_matrix=cm_list,
         positive_rate=positive_rate,
+        threshold=threshold,
     )
 
 
