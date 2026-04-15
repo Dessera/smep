@@ -11,12 +11,20 @@ from .fetchers import (
     get_registry,
 )
 
-# Re-export processor components
-from .processors import (
-    DataProcessor,
-    MIMIC3Processor,
-    DataProcessorRegistry,
-    get_processor_registry,
+# Re-export exporter components
+from .exporters import (
+    DataExporter,
+    DataExporterRegistry,
+    MIMIC3Exporter,
+    get_exporter_registry,
+)
+
+# Re-export builder components
+from .builders import (
+    DatasetBuilder,
+    DatasetBuilderRegistry,
+    DefaultDatasetBuilder,
+    get_builder_registry,
 )
 
 __all__ = [
@@ -28,9 +36,14 @@ __all__ = [
     "MIMIC310KFetcher",
     "DataFetcherRegistry",
     "get_registry",
-    # Processors
-    "DataProcessor",
-    "MIMIC3Processor",
-    "DataProcessorRegistry",
-    "get_processor_registry",
+    # Exporters
+    "DataExporter",
+    "DataExporterRegistry",
+    "MIMIC3Exporter",
+    "get_exporter_registry",
+    # Builders
+    "DatasetBuilder",
+    "DatasetBuilderRegistry",
+    "DefaultDatasetBuilder",
+    "get_builder_registry",
 ]

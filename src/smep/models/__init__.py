@@ -6,6 +6,27 @@ import logging
 from .model import Model
 from .xgboost import XGBoostModel
 from .dnn import DNNModel
+from .data_loader import TrainingData, load_training_data
+from .evaluator import (
+    EvaluationResult,
+    evaluate,
+    compute_curve_points,
+    render_curves,
+    write_evaluation_outputs,
+)
+from .explainer import (
+    ShapResult,
+    normalize_shap_values,
+    normalize_expected_value,
+    write_explain_outputs,
+    to_json_compatible,
+)
+from .feature_selector import (
+    FeatureImportanceResult,
+    FeatureImportanceReport,
+    evaluate_feature_importance,
+    write_feature_importance_outputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,4 +156,20 @@ __all__ = [
     "DNNModel",
     "ModelRegistry",
     "get_registry",
+    "TrainingData",
+    "load_training_data",
+    "EvaluationResult",
+    "evaluate",
+    "compute_curve_points",
+    "render_curves",
+    "write_evaluation_outputs",
+    "ShapResult",
+    "normalize_shap_values",
+    "normalize_expected_value",
+    "write_explain_outputs",
+    "to_json_compatible",
+    "FeatureImportanceResult",
+    "FeatureImportanceReport",
+    "evaluate_feature_importance",
+    "write_feature_importance_outputs",
 ]

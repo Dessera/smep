@@ -1,11 +1,17 @@
 """Data fetching and processing CLI commands."""
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 import typer
 import logging
 
-from smep.data import get_registry, get_processor_registry, KaggleDownloadError
+from smep.data import (
+    get_registry,
+    get_exporter_registry,
+    get_builder_registry,
+    KaggleDownloadError,
+)
+from smep.data.builders.default import DEFAULT_DROP_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +19,275 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Manage data fetching and processing for SMEP datasets.",
 )
+
+
+# ------------------------------------------------------------------
+# export  –  raw MIMIC → base table
+# ------------------------------------------------------------------
+
+
+@app.command(name="export")
+def export_base_table(
+    name: str = typer.Argument(
+        ...,
+        help="Exporter name (e.g. 'mimic3')",
+    ),
+    source: Path = typer.Argument(
+        ...,
+        help="Path to the raw data directory",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Output directory for the base table. "
+            "Defaults to <source>_exported."
+        ),
+    ),
+    min_age: int = typer.Option(
+        18,
+        "--min-age",
+        help="Minimum patient age for cohort inclusion.",
+    ),
+    first_stay_only: bool = typer.Option(
+        True,
+        "--first-stay-only/--all-stays",
+        help="Keep only the first ICU stay per subject.",
+    ),
+    time_window_hours: int = typer.Option(
+        24,
+        "--time-window-hours",
+        help=(
+            "Aggregation window (hours from ICU admission). "
+            "Also used as the minimum ICU stay length."
+        ),
+    ),
+    schema_version: str = typer.Option(
+        "v1",
+        "--schema-version",
+        help="Schema version tag written into metadata.",
+    ),
+) -> None:
+    """Export a base table from raw data.
+
+    The base table is an extractedMimic-style wide table that can later
+    be consumed by ``smep data build-dataset``.
+
+    Example:
+        smep data export mimic3 .data/mimic-iii-clinical-database-demo-1.4
+    """
+    try:
+        source = source.resolve()
+        if output is None:
+            output = source.parent / f"{source.name}_exported"
+        else:
+            output = output.resolve()
+
+        registry = get_exporter_registry()
+
+        try:
+            exporter = registry.get_exporter(
+                name,
+                min_age=min_age,
+                first_stay_only=first_stay_only,
+                time_window_hours=time_window_hours,
+                schema_version=schema_version,
+            )
+        except (KeyError, ValueError) as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+
+        typer.echo(f"Exporting base table with '{name}' exporter…")
+        typer.echo(f"Source: {source}")
+        typer.echo(f"Output: {output}")
+        typer.echo(f"Time window: {time_window_hours} h")
+        typer.echo(f"Min age: {min_age}")
+        typer.echo(f"First stay only: {first_stay_only}")
+
+        exporter.export(source, output)
+        typer.echo(f"✓ Base table exported to {output}")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        logger.exception("Export failed")
+        raise typer.Exit(code=1)
+
+
+# ------------------------------------------------------------------
+# build  –  base table → train/val/test dataset
+# ------------------------------------------------------------------
+
+
+@app.command(name="build")
+def build_dataset(
+    base_table: Path = typer.Argument(
+        ...,
+        help="Path to base_table.csv or directory containing it.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Output directory for the dataset. "
+            "Defaults to <base_table_dir>_dataset."
+        ),
+    ),
+    label: str = typer.Option(
+        "hospital_expire_flag",
+        "--label",
+        help="Label column name.",
+    ),
+    split: str = typer.Option(
+        "0.8,0.1,0.1",
+        "--split",
+        help="Train/val/test ratios, comma-separated (must sum to 1.0).",
+    ),
+    random_state: int = typer.Option(
+        42,
+        "--random-state",
+        help="Random seed for reproducibility.",
+    ),
+    stratify: bool = typer.Option(
+        True,
+        "--stratify/--no-stratify",
+        help="Stratify splits by label.",
+    ),
+    imputer: str = typer.Option(
+        "median",
+        "--imputer",
+        help="Imputation strategy: median, mean, knn, none.",
+    ),
+    scaler: str = typer.Option(
+        "standard",
+        "--scaler",
+        help="Scaling strategy: standard, minmax, robust, none.",
+    ),
+    min_coverage: float = typer.Option(
+        0.0,
+        "--min-coverage",
+        help="Minimum non-missing rate (0-1) to keep a column.",
+    ),
+    drop_columns: Optional[str] = typer.Option(
+        None,
+        "--drop-columns",
+        help="Comma-separated column names to exclude.",
+    ),
+    keep_columns: Optional[str] = typer.Option(
+        None,
+        "--keep-columns",
+        help="Comma-separated column names to keep (mutually exclusive with --drop-columns).",
+    ),
+) -> None:
+    """Build a training dataset from a base table.
+
+    Reads a base_table.csv (produced by ``smep data export``), applies
+    column selection, imputation, encoding, scaling, and stratified
+    splitting to produce train/val/test CSV files.
+
+    Example:
+        smep data build ./exported -o ./dataset
+    """
+    try:
+        base_table = base_table.resolve()
+        if output is None:
+            parent = base_table if base_table.is_dir() else base_table.parent
+            output = parent.parent / f"{parent.name}_dataset"
+        else:
+            output = output.resolve()
+
+        # Parse split ratios
+        try:
+            parts = [float(x.strip()) for x in split.split(",")]
+        except ValueError:
+            typer.echo(
+                "Error: --split must be three comma-separated floats", err=True
+            )
+            raise typer.Exit(code=1)
+
+        if len(parts) != 3:
+            typer.echo(
+                "Error: --split must have exactly 3 values (train,val,test)",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if abs(sum(parts) - 1.0) > 0.001:
+            typer.echo(
+                f"Error: --split values must sum to 1.0 (got {sum(parts):.4f})",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        split_tuple = (parts[0], parts[1], parts[2])
+
+        # Validate imputer/scaler choices
+        valid_imputers = {"median", "mean", "knn", "none"}
+        if imputer not in valid_imputers:
+            typer.echo(
+                f"Error: --imputer must be one of {valid_imputers}", err=True
+            )
+            raise typer.Exit(code=1)
+
+        valid_scalers = {"standard", "minmax", "robust", "none"}
+        if scaler not in valid_scalers:
+            typer.echo(
+                f"Error: --scaler must be one of {valid_scalers}", err=True
+            )
+            raise typer.Exit(code=1)
+
+        # Mutually exclusive
+        if drop_columns is not None and keep_columns is not None:
+            typer.echo(
+                "Error: --drop-columns and --keep-columns are mutually exclusive",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        drop_list = (
+            [c.strip() for c in drop_columns.split(",")]
+            if drop_columns
+            else DEFAULT_DROP_COLUMNS
+        )
+        keep_list = (
+            [c.strip() for c in keep_columns.split(",")]
+            if keep_columns
+            else None
+        )
+
+        registry = get_builder_registry()
+        builder = registry.get_builder(
+            "default",
+            label=label,
+            split=split_tuple,
+            random_state=random_state,
+            stratify=stratify,
+            imputer=imputer,
+            scaler=scaler,
+            min_coverage=min_coverage,
+            drop_columns=drop_list,
+            keep_columns=keep_list,
+        )
+
+        typer.echo("Building dataset…")
+        typer.echo(f"Source: {base_table}")
+        typer.echo(f"Output: {output}")
+        typer.echo(f"Label: {label}")
+        typer.echo(f"Split: {split}")
+        typer.echo(f"Imputer: {imputer}  Scaler: {scaler}")
+
+        builder.build(base_table, output)
+        typer.echo(f"✓ Dataset built at {output}")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        logger.exception("Build failed")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -130,200 +405,4 @@ def info(
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         logger.exception("Error getting data source info")
-        raise typer.Exit(code=1)
-
-
-@app.command()
-def process(
-    name: str = typer.Argument(
-        ..., help="Name of the processor to use (e.g., 'mimic3')"
-    ),
-    source: Path = typer.Argument(
-        ..., help="Path to the source data directory"
-    ),
-    output: Optional[Path] = typer.Option(
-        None,
-        "--output",
-        "-o",
-        help="Output directory for processed data. Defaults to source directory + '_processed'.",
-    ),
-    agg_stats: Optional[List[str]] = typer.Option(
-        None,
-        "--agg-stats",
-        help=(
-            "Aggregation statistics for temporal features. "
-            "Valid values: mean, max, min, std. "
-            "Can be specified multiple times (e.g. --agg-stats mean --agg-stats std). "
-            "Defaults to 'mean'."
-        ),
-    ),
-    test_size: float = typer.Option(
-        0.2,
-        "--test-size",
-        help="Fraction of samples reserved for the test split.",
-    ),
-    random_state: int = typer.Option(
-        42,
-        "--random-state",
-        help="Random seed used for reproducible dataset splitting.",
-    ),
-    stratify: bool = typer.Option(
-        True,
-        "--stratify/--no-stratify",
-        help="Use label-stratified train/test splitting.",
-    ),
-    split_enabled: bool = typer.Option(
-        True,
-        "--split/--no-split",
-        help="Generate train/test split files alongside the full dataset.",
-    ),
-    min_age: int = typer.Option(
-        15,
-        "--min-age",
-        help="Minimum patient age in years for cohort inclusion.",
-    ),
-    min_icu_hours: int = typer.Option(
-        12,
-        "--min-icu-hours",
-        help="Minimum ICU stay duration in hours for cohort inclusion.",
-    ),
-    first_stay_only: bool = typer.Option(
-        True,
-        "--first-stay-only/--all-stays",
-        help="Keep only the first ICU stay per subject.",
-    ),
-) -> None:
-    """Process data using a specified processor.
-
-    Example:
-        smep data process mimic3 .data/mimic-iii-clinical-database-demo-1.4
-        smep data process mimic3 .data/mimic-iii --output .data/processed
-        smep data process mimic3 .data/mimic-iii --agg-stats mean --agg-stats std
-        smep data process mimic3 .data/mimic-iii --test-size 0.25 --random-state 7
-    """
-    try:
-        # Resolve source path
-        source = source.resolve()
-
-        # Determine output directory
-        if output is None:
-            output = source.parent / f"{source.name}_processed"
-        else:
-            output = output.resolve()
-
-        # Resolve agg_stats: default to ["mean"] if not specified
-        resolved_agg_stats = agg_stats if agg_stats else ["mean"]
-
-        # Get the processor from registry
-        registry = get_processor_registry()
-
-        try:
-            processor = registry.get_processor(
-                name,
-                agg_stats=resolved_agg_stats,
-                test_size=test_size,
-                random_state=random_state,
-                stratify=stratify,
-                split_enabled=split_enabled,
-                min_age=min_age,
-                min_icu_hours=min_icu_hours,
-                first_stay_only=first_stay_only,
-            )
-        except (KeyError, ValueError) as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-
-        # Process the data
-        typer.echo(f"Processing data with {name} processor...")
-        typer.echo(f"Source directory: {source}")
-        typer.echo(f"Output directory: {output}")
-        typer.echo(f"Aggregation statistics: {', '.join(resolved_agg_stats)}")
-        typer.echo(f"Train/test split enabled: {split_enabled}")
-        typer.echo(f"Minimum age: {min_age}")
-        typer.echo(f"Minimum ICU hours: {min_icu_hours}")
-        typer.echo(f"First ICU stay only: {first_stay_only}")
-        if split_enabled:
-            typer.echo(f"Test split ratio: {test_size}")
-            typer.echo(f"Random seed: {random_state}")
-            typer.echo(f"Stratified split: {stratify}")
-
-        try:
-            processor.process(source, output)
-            typer.echo(f"✓ Successfully processed data to {output}")
-        except FileNotFoundError as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-        except ValueError as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-        except RuntimeError as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-        except Exception as e:
-            typer.echo(f"Unexpected error: {e}", err=True)
-            logger.exception("Unexpected error during processing")
-            raise typer.Exit(code=1)
-
-    except typer.Exit:
-        raise
-
-
-@app.command()
-def list_processors() -> None:
-    """List all available data processors.
-
-    Example:
-        smep data list-processors
-    """
-    try:
-        registry = get_processor_registry()
-        processors = registry.get_all_processor_info()
-
-        if not processors:
-            typer.echo("No data processors available.")
-            return
-
-        # Display processors
-        typer.echo("\nAvailable Data Processors:")
-        for proc_info in processors:
-            typer.echo(
-                f"  • {proc_info['name']:<20} - {proc_info['description']}"
-            )
-
-        typer.echo(
-            "\nUse 'smep data process <name> <source>' to process a dataset."
-        )
-    except Exception as e:
-        typer.echo(f"Error listing processors: {e}", err=True)
-        logger.exception("Error listing processors")
-        raise typer.Exit(code=1)
-
-
-@app.command()
-def processor_info(
-    name: str = typer.Argument(..., help="Name of the processor"),
-) -> None:
-    """Show detailed information about a data processor.
-
-    Example:
-        smep data processor-info mimic3-demo
-    """
-    try:
-        registry = get_processor_registry()
-
-        try:
-            proc_info = registry.get_processor_info(name)
-        except KeyError as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-
-        # Display info
-        typer.echo(f"\nData Processor: {proc_info['name']}")
-        typer.echo(f"Description: {proc_info['description']}")
-
-    except typer.Exit:
-        raise
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        logger.exception("Error getting processor info")
         raise typer.Exit(code=1)
