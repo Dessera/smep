@@ -4,6 +4,7 @@ Computes per-stay:
   - elixhauser_hospital   van Walraven weighted Elixhauser comorbidity score
   - diabetes              diabetes indicator (0/1)
   - metastatic_cancer     metastatic cancer indicator (0/1)
+  - tumor                 solid tumor without metastasis indicator (0/1)
   - first_service         first service line on admission
   - dbsource              data source (CareVue/MetaVision)
 
@@ -503,6 +504,7 @@ def _compute_elixhauser(diagnoses: pd.DataFrame) -> pd.DataFrame:
                 "elixhauser_hospital": score,
                 "diabetes": int("dm_uncomp" in flags or "dm_comp" in flags),
                 "metastatic_cancer": int("mets" in flags),
+                "tumor": int("tumor" in flags),
             }
         )
 
@@ -513,6 +515,7 @@ def _compute_elixhauser(diagnoses: pd.DataFrame) -> pd.DataFrame:
                 "elixhauser_hospital",
                 "diabetes",
                 "metastatic_cancer",
+                "tumor",
             ]
         )
     return pd.DataFrame(records)
@@ -562,6 +565,7 @@ COMORBIDITY_COLUMNS: list[str] = [
     "elixhauser_hospital",
     "diabetes",
     "metastatic_cancer",
+    "tumor",
     "first_service",
     "dbsource",
 ]
@@ -597,6 +601,7 @@ def compute_comorbidity(
     result["metastatic_cancer"] = (
         result["metastatic_cancer"].fillna(0).astype(int)
     )
+    result["tumor"] = result["tumor"].fillna(0).astype(int)
 
     # --- first_service ---
     first_svc = _extract_first_service(source_path, read_csv_fn)

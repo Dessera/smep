@@ -74,12 +74,14 @@ class XGBoostModel(Model):
         use_early_stopping = X_val is not None and y_val is not None
 
         base_classifier = XGBClassifier(
-            n_estimators=100,
-            max_depth=20,
-            learning_rate=0.1,
-            subsample=0.5,
-            min_child_weight=0.1,
-            gamma=0.0,
+            n_estimators=500,
+            max_depth=10,
+            learning_rate=0.01,
+            subsample=0.7,
+            min_child_weight=0.3,
+            gamma=1,
+            reg_alpha=1,
+            reg_lambda=1,
             scale_pos_weight=float(scale_pos_weight),
             eval_metric="logloss",
             random_state=42,
@@ -248,12 +250,14 @@ class XGBoostModel(Model):
         self, tuning: dict[str, Any] | None
     ) -> dict[str, Any]:
         default_grid = {
-            "max_depth": [3, 4, 5, 6, 7, 8],
+            "max_depth": [3, 5, 7, 10, 20, 40, 60],
             "learning_rate": [0.01, 0.05, 0.1],
-            "n_estimators": [50, 100, 200, 300],
-            "subsample": [0.7, 0.8, 1.0],
-            "colsample_bytree": [0.7, 0.8, 1.0],
-            "min_child_weight": [1, 3, 5],
+            "n_estimators": [50, 100, 200, 300, 500, 1000],
+            "subsample": [0.1, 0.3, 0.5, 0.7, 0.8, 1.0],
+            "min_child_weight": [0.1, 0.3, 0.5, 1, 3, 5],
+            # "gamma": [0.0, 0.1, 0.3, 0.5, 1, 3],
+            # "reg_alpha": [0.0, 0.1, 0.3, 0.5, 1, 3],
+            # "reg_lambda": [0.0, 0.1, 0.3, 0.5, 1, 3],
         }
 
         config = tuning.copy() if tuning is not None else {}

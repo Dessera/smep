@@ -64,19 +64,19 @@ CHARTEVENTS_FEATURES: dict[str, dict[str, Any]] = {
         "normalize_to_fraction": True,
     },
     "gcs_eye": {
-        "itemids": [220739],
+        "itemids": [220739, 184],
         "valid_min": 1,
         "valid_max": 4,
         "unit": "score",
     },
     "gcs_verbal": {
-        "itemids": [223900],
+        "itemids": [223900, 723],
         "valid_min": 1,
         "valid_max": 5,
         "unit": "score",
     },
     "gcs_motor": {
-        "itemids": [223901],
+        "itemids": [223901, 454],
         "valid_min": 1,
         "valid_max": 6,
         "unit": "score",
@@ -92,14 +92,20 @@ CHARTEVENTS_FEATURES: dict[str, dict[str, Any]] = {
         "valid_min": 100,
         "valid_max": 250,
         "unit": "cm",
-        # CareVue (920) and MetaVision (226730) record inches
-        "inches_itemids": {920, 226730},
+        # CareVue 920 ("Height") and MetaVision 226707 ("Height (Inches)")
+        # store values in inches; 1394 (CareVue "Height (cm)") and 226730
+        # (MetaVision "Height") store values in cm.
+        "inches_itemids": {920, 226707},
+        # Height is recorded once at admission, often before ICU intime;
+        # skip the time-window lower bound so pre-ICU values are captured.
+        "patient_level_lookup": True,
     },
     "weight": {
         "itemids": [762, 763, 3580, 3582, 226512, 224639],
         "valid_min": 20,
         "valid_max": 300,
         "unit": "kg",
+        "patient_level_lookup": True,
     },
 }
 
@@ -107,6 +113,12 @@ CHARTEVENTS_FEATURES: dict[str, dict[str, Any]] = {
 # Lab-test features extracted from LABEVENTS
 # ---------------------------------------------------------------------------
 LABEVENTS_FEATURES: dict[str, dict[str, Any]] = {
+    "albumin": {
+        "itemids": [50862],
+        "valid_min": 0.5,
+        "valid_max": 6.0,
+        "unit": "g/dL",
+    },
     "aniongap": {
         "itemids": [50868],
         "valid_min": 3,
@@ -278,6 +290,7 @@ COMORBIDITY_COLUMNS: list[str] = [
     "elixhauser_hospital",
     "diabetes",
     "metastatic_cancer",
+    "tumor",
     "first_service",
     "dbsource",
 ]

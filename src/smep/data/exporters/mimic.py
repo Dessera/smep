@@ -400,6 +400,26 @@ class MIMIC3Exporter(DataExporter):
         if not item_lookup:
             return pd.DataFrame()
 
+        # Itemids whose features opt out of the strict time-window lower bound
+        # (e.g. height, recorded once at admission before ICU intime).
+        ignore_window_itemids: set[int] = {
+            item_id
+            for name, spec in feature_specs.items()
+            if spec.get("ignore_time_window")
+            for item_id in spec["itemids"]
+        }
+
+        # Itemids that should be looked up at the patient level (subject_id
+        # only) rather than at the admission level (subject+hadm+icustay).
+        # Used for stable anthropometric values such as height that may be
+        # recorded under a different admission than the current sepsis stay.
+        patient_level_itemids: set[int] = {
+            item_id
+            for name, spec in feature_specs.items()
+            if spec.get("patient_level_lookup")
+            for item_id in spec["itemids"]
+        }
+
         required = [
             "subject_id",
             "hadm_id",
@@ -423,6 +443,7 @@ class MIMIC3Exporter(DataExporter):
         window_td = pd.Timedelta(hours=self.time_window_hours)
 
         accum: list[pd.DataFrame] = []
+        patient_level_accum: list[pd.DataFrame] = []
 
         try:
             for chunk in self._read_csv_chunks(file_path, required=required):
@@ -441,6 +462,57 @@ class MIMIC3Exporter(DataExporter):
                 if chunk.empty:
                     continue
 
+                # --- Patient-level items (e.g. height) ---
+                # Merge on subject_id only so measurements from any admission
+                # of the same patient are captured.
+                if patient_level_itemids:
+                    pl_chunk = chunk[
+                        chunk["itemid"].isin(patient_level_itemids)
+                    ].copy()
+                    if not pl_chunk.empty:
+                        # Drop admission/stay keys from the raw chunk so that
+                        # the merge below assigns the cohort's hadm_id and
+                        # icustay_id (avoiding _x/_y suffix conflicts).
+                        pl_chunk = pl_chunk.drop(
+                            columns=[
+                                c
+                                for c in ("hadm_id", "icustay_id")
+                                if c in pl_chunk.columns
+                            ]
+                        )
+                        pl_chunk = pl_chunk.merge(
+                            cohort_df[["subject_id", "hadm_id", "icustay_id"]],
+                            on="subject_id",
+                            how="inner",
+                        )
+                        pl_chunk = pl_chunk[pl_chunk["valuenum"].notna()].copy()
+                        if not pl_chunk.empty:
+                            pl_chunk["feature_name"] = pl_chunk["itemid"].map(
+                                item_lookup
+                            )
+                            pl_chunk = self._apply_unit_conversions(
+                                pl_chunk, feature_specs
+                            )
+                            pl_chunk = self._apply_range_filter(
+                                pl_chunk, feature_specs
+                            )
+                            if not pl_chunk.empty:
+                                patient_level_accum.append(
+                                    pl_chunk[
+                                        [
+                                            "subject_id",
+                                            "hadm_id",
+                                            "icustay_id",
+                                            "feature_name",
+                                            "valuenum",
+                                        ]
+                                    ]
+                                )
+                    chunk = chunk[~chunk["itemid"].isin(patient_level_itemids)]
+                    if chunk.empty:
+                        continue
+
+                # --- Normal items ---
                 # Join with cohort to get intime
                 chunk = chunk.merge(
                     cohort_df[cohort_cols], on=merge_keys, how="inner"
@@ -449,11 +521,24 @@ class MIMIC3Exporter(DataExporter):
                     continue
 
                 # Time-window filter
-                chunk = chunk[
-                    chunk["valuenum"].notna()
-                    & (chunk["charttime"] >= chunk["intime"])
-                    & (chunk["charttime"] <= chunk["intime"] + window_td)
-                ].copy()
+                # Features flagged with ignore_time_window skip the lower
+                # bound (charttime >= intime) so admission-time recordings
+                # made before ICU intime are still captured.
+                _valid = chunk["valuenum"].notna()
+                _in_window = (chunk["charttime"] >= chunk["intime"]) & (
+                    chunk["charttime"] <= chunk["intime"] + window_td
+                )
+                if ignore_window_itemids:
+                    _ignore = chunk["itemid"].isin(ignore_window_itemids)
+                    chunk = pd.concat(
+                        [
+                            chunk[~_ignore & _valid & _in_window],
+                            chunk[_ignore & _valid],
+                        ],
+                        ignore_index=True,
+                    )
+                else:
+                    chunk = chunk[_valid & _in_window].copy()
                 if chunk.empty:
                     continue
 
@@ -484,10 +569,16 @@ class MIMIC3Exporter(DataExporter):
             logger.warning("Events file not found: %s – skipping", file_path)
             return pd.DataFrame()
 
-        if not accum:
+        if not accum and not patient_level_accum:
             return pd.DataFrame()
 
-        events = pd.concat(accum, ignore_index=True)
+        all_events: list[pd.DataFrame] = []
+        if accum:
+            all_events.append(pd.concat(accum, ignore_index=True))
+        if patient_level_accum:
+            all_events.append(pd.concat(patient_level_accum, ignore_index=True))
+
+        events = pd.concat(all_events, ignore_index=True)
         keys = ["subject_id", "hadm_id", "icustay_id", "feature_name"]
         agg = events.groupby(keys, as_index=False)["valuenum"].agg(
             feat_min="min",
@@ -644,6 +735,27 @@ class MIMIC3Exporter(DataExporter):
         base = base.merge(infection_df, on=keys, how="left")
         base = base.merge(sepsis_df, on=keys, how="left")
         base = base.merge(comorbidity_df, on=keys, how="left")
+
+        # Derived: gcs_total from components when direct total is absent
+        # CareVue records gcs_total (itemid 198); MetaVision records only
+        # eye + verbal + motor components.  Fill missing total values by
+        # summing the component aggregates, matching the approach in scores.py.
+        for stat in ("min", "max", "mean"):
+            total_col = f"gcs_total_{stat}"
+            eye_col = f"gcs_eye_{stat}"
+            verbal_col = f"gcs_verbal_{stat}"
+            motor_col = f"gcs_motor_{stat}"
+            if total_col in base.columns:
+                components_available = (
+                    base[eye_col].notna()
+                    & base[verbal_col].notna()
+                    & base[motor_col].notna()
+                )
+                derived = base[eye_col] + base[verbal_col] + base[motor_col]
+                base[total_col] = base[total_col].where(
+                    base[total_col].notna(),
+                    derived.where(components_available),
+                )
 
         # Derived: BMI from temporal height/weight means
         h_m = base.get("height_mean", pd.Series(dtype=float))

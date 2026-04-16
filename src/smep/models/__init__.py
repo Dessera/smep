@@ -27,6 +27,7 @@ from .feature_selector import (
     FeatureImportanceResult,
     FeatureImportanceReport,
     evaluate_feature_importance,
+    evaluate_lasso_importance,
     write_feature_importance_outputs,
 )
 

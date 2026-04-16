@@ -19,6 +19,7 @@ from smep.models.evaluator import (
 from smep.models.explainer import write_explain_outputs, to_json_compatible
 from smep.models.feature_selector import (
     evaluate_feature_importance,
+    evaluate_lasso_importance,
     write_feature_importance_outputs,
 )
 
@@ -711,8 +712,12 @@ def feature_importance(
     model: str = typer.Argument(
         ..., help="Model name to look up in the registry (e.g. 'xgboost')"
     ),
-    weight_dir: Path = typer.Argument(
-        ..., help="Directory containing exported model weights"
+    weight_dir: Optional[Path] = typer.Argument(
+        None,
+        help=(
+            "Directory containing exported model weights. "
+            "Required for 'permutation' method, ignored for 'lasso'."
+        ),
     ),
     data_source: Path = typer.Argument(
         ...,
@@ -727,35 +732,47 @@ def feature_importance(
             "defaults to ./feature_importance/<model>"
         ),
     ),
+    method: str = typer.Option(
+        "permutation",
+        "--method",
+        "-m",
+        help="Feature selection method: permutation or lasso.",
+    ),
     scoring: str = typer.Option(
         "roc_auc",
         "--scoring",
-        help="Scoring metric for permutation importance.",
+        help="Scoring metric for permutation importance (ignored for lasso).",
     ),
     n_repeats: int = typer.Option(
         10,
         "--n-repeats",
-        help="Number of permutation repeats per feature.",
+        help="Number of permutation repeats per feature (ignored for lasso).",
+    ),
+    cv: int = typer.Option(
+        5,
+        "--cv",
+        help="Cross-validation folds for LASSO alpha selection (ignored for permutation).",
     ),
 ) -> None:
-    """Evaluate feature importance using permutation importance.
+    """Evaluate feature importance using permutation importance or LASSO.
 
-    Identifies noise features (importance <= 0) and signal features,
-    writes a JSON report and visualization.
+    Identifies noise features (importance <= 0 or coefficient == 0) and
+    signal features, writes a JSON report and visualization.
 
     Example:
         smep model feature-importance xgboost ./weights/xgboost ./build_output
-        smep model feature-importance dnn ./weights/dnn ./build_output --scoring f1
+        smep model feature-importance xgboost ./weights/xgboost ./build_output --method lasso
+        smep model feature-importance xgboost - ./build_output --method lasso
     """
     try:
         import pandas as pd
         import numpy as np
 
-        # Resolve and validate weight_dir
-        weight_dir = weight_dir.resolve()
-        if not weight_dir.exists() or not weight_dir.is_dir():
+        method_clean = method.strip().lower()
+        valid_methods = {"permutation", "lasso"}
+        if method_clean not in valid_methods:
             typer.echo(
-                f"Error: weight directory does not exist: {weight_dir}",
+                "Error: --method must be one of: permutation, lasso",
                 err=True,
             )
             raise typer.Exit(code=1)
@@ -769,10 +786,6 @@ def feature_importance(
             )
             raise typer.Exit(code=1)
 
-        if n_repeats < 1:
-            typer.echo("Error: --n-repeats must be >= 1", err=True)
-            raise typer.Exit(code=1)
-
         # Determine output path
         if output is None:
             output = Path.cwd() / "feature_importance" / model
@@ -780,27 +793,7 @@ def feature_importance(
             output = output.resolve()
         output.mkdir(parents=True, exist_ok=True)
 
-        # Retrieve model instance from registry
-        registry = get_registry()
-        try:
-            model_instance = registry.get_model(model)
-        except KeyError as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-
-        # 1. Load model weights
-        typer.echo(f"Loading model '{model}' from {weight_dir}...")
-        try:
-            model_instance.load(weight_dir)
-        except (FileNotFoundError, RuntimeError) as e:
-            typer.echo(f"Error: {e}", err=True)
-            raise typer.Exit(code=1)
-        except Exception as e:
-            typer.echo(f"Unexpected error during model loading: {e}", err=True)
-            logger.exception("Unexpected error during model loading")
-            raise typer.Exit(code=1)
-
-        # 2. Load test data
+        # 1. Load test data
         x_file = data_source / "X_test.csv"
         y_file = data_source / "y_test.csv"
         if not x_file.exists() or not y_file.exists():
@@ -822,9 +815,12 @@ def feature_importance(
             typer.echo(f"Error reading test data: {e}", err=True)
             raise typer.Exit(code=1)
 
-        # 3. Load feature names
+        # 2. Load feature names
         feature_names: list[str] = []
-        for candidate_dir in [weight_dir, data_source]:
+        candidate_dirs = [data_source]
+        if weight_dir is not None:
+            candidate_dirs.insert(0, weight_dir.resolve())
+        for candidate_dir in candidate_dirs:
             fn_file = candidate_dir / "feature_names.txt"
             if fn_file.is_file():
                 feature_names = [
@@ -837,37 +833,109 @@ def feature_importance(
         if not feature_names:
             feature_names = [f"feature_{i}" for i in range(X.shape[1])]
 
-        typer.echo(f"Evaluating feature importance for '{model}'...")
         typer.echo(
             f"Data: {x_file} ({X.shape[0]} samples, {X.shape[1]} features)"
         )
-        typer.echo(f"Scoring: {scoring}, Repeats: {n_repeats}")
 
-        # 4. Compute permutation importance
-        try:
-            report = evaluate_feature_importance(
-                model=model_instance,
-                X=X,
-                y=y,
-                feature_names=feature_names,
-                scoring=scoring,
-                n_repeats=n_repeats,
-            )
-        except Exception as e:
+        # 3. Compute importance based on selected method
+        if method_clean == "lasso":
+            if cv < 2:
+                typer.echo("Error: --cv must be >= 2", err=True)
+                raise typer.Exit(code=1)
+
             typer.echo(
-                f"Error during feature importance computation: {e}", err=True
+                f"Evaluating feature importance for '{model}' "
+                f"using LASSO (cv={cv})..."
             )
-            logger.exception("Error during feature importance computation")
-            raise typer.Exit(code=1)
 
-        # 5. Write outputs
+            try:
+                report = evaluate_lasso_importance(
+                    X=X,
+                    y=y,
+                    feature_names=feature_names,
+                    cv=cv,
+                )
+            except Exception as e:
+                typer.echo(
+                    f"Error during LASSO importance computation: {e}",
+                    err=True,
+                )
+                logger.exception("Error during LASSO importance computation")
+                raise typer.Exit(code=1)
+        else:
+            # permutation method requires a trained model
+            if weight_dir is None:
+                typer.echo(
+                    "Error: weight_dir is required for permutation method.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            weight_dir = weight_dir.resolve()
+            if not weight_dir.exists() or not weight_dir.is_dir():
+                typer.echo(
+                    f"Error: weight directory does not exist: {weight_dir}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            if n_repeats < 1:
+                typer.echo("Error: --n-repeats must be >= 1", err=True)
+                raise typer.Exit(code=1)
+
+            # Retrieve model instance from registry
+            registry = get_registry()
+            try:
+                model_instance = registry.get_model(model)
+            except KeyError as e:
+                typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(code=1)
+
+            typer.echo(f"Loading model '{model}' from {weight_dir}...")
+            try:
+                model_instance.load(weight_dir)
+            except (FileNotFoundError, RuntimeError) as e:
+                typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(code=1)
+            except Exception as e:
+                typer.echo(
+                    f"Unexpected error during model loading: {e}", err=True
+                )
+                logger.exception("Unexpected error during model loading")
+                raise typer.Exit(code=1)
+
+            typer.echo(
+                f"Evaluating feature importance for '{model}' "
+                f"using permutation (scoring={scoring}, repeats={n_repeats})..."
+            )
+
+            try:
+                report = evaluate_feature_importance(
+                    model=model_instance,
+                    X=X,
+                    y=y,
+                    feature_names=feature_names,
+                    scoring=scoring,
+                    n_repeats=n_repeats,
+                )
+            except Exception as e:
+                typer.echo(
+                    f"Error during feature importance computation: {e}",
+                    err=True,
+                )
+                logger.exception("Error during feature importance computation")
+                raise typer.Exit(code=1)
+
+        # 4. Write outputs
         try:
             artifacts = write_feature_importance_outputs(output, report)
         except RuntimeError as e:
             typer.echo(f"Error writing outputs: {e}", err=True)
             raise typer.Exit(code=1)
 
-        typer.echo(f"\n✓ Feature importance analysis complete.")
+        typer.echo(
+            f"\n✓ Feature importance analysis complete (method={method_clean})."
+        )
         typer.echo(f"Output: {output}")
         typer.echo(f"Report: {output / artifacts['report']}")
         typer.echo(f"Plot: {output / artifacts['plot']}")
@@ -877,17 +945,20 @@ def feature_importance(
         )
 
         if report.noise_features:
-            typer.echo(f"\nNoise features (importance ≤ 0):")
+            typer.echo(f"\nNoise features (coefficient = 0 / importance ≤ 0):")
             for name in report.noise_features:
                 typer.echo(f"  ✗ {name}")
 
         # Show top 10 signal features
-        top_signal = [r for r in report.results if r.importance_mean > 0][:10]
+        label = "coefficient" if method_clean == "lasso" else "importance"
+        top_signal = [r for r in report.results if r.importance_mean != 0.0][
+            :10
+        ]
         if top_signal:
             typer.echo(f"\nTop signal features:")
             for r in top_signal:
                 typer.echo(
-                    f"  ✓ {r.feature:<30} importance={r.importance_mean:.6f} "
+                    f"  ✓ {r.feature:<30} {label}={r.importance_mean:.6f} "
                     f"(±{r.importance_std:.6f})"
                 )
 
