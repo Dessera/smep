@@ -55,7 +55,28 @@ def write_outputs(
     _write_json(target_path / "base_table_quality.json", quality)
 
 
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively replace float NaN/Inf with None for valid JSON."""
+    if isinstance(obj, float) and (
+        obj != obj or obj == float("inf") or obj == float("-inf")
+    ):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    sanitized = _sanitize_for_json(data)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False, default=str)
+        json.dump(
+            sanitized,
+            fh,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        )
     logger.info("Wrote %s", path)

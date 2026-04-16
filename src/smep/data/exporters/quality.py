@@ -80,11 +80,12 @@ def generate_quality_report(
         s = df[col].dropna()
         if s.empty:
             continue
+        std_val = s.std()
         summary[col] = {
             "min": round(float(s.min()), 4),
             "max": round(float(s.max()), 4),
             "mean": round(float(s.mean()), 4),
-            "std": round(float(s.std()), 4),
+            "std": round(float(std_val), 4) if pd.notna(std_val) else None,
         }
     report["numeric_summary"] = summary
 

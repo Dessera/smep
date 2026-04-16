@@ -506,16 +506,36 @@ class MIMIC3Exporter(DataExporter):
         feature_specs: dict[str, dict[str, Any]],
     ) -> pd.DataFrame:
         for feat_name, spec in feature_specs.items():
+            # Fahrenheit → Celsius
             f_ids = spec.get("fahrenheit_itemids")
-            if not f_ids:
-                continue
-            mask = (chunk["feature_name"] == feat_name) & (
-                chunk["itemid"].isin(f_ids)
-            )
-            if mask.any():
-                chunk.loc[mask, "valuenum"] = (
-                    chunk.loc[mask, "valuenum"] - 32.0
-                ) * (5.0 / 9.0)
+            if f_ids:
+                mask = (chunk["feature_name"] == feat_name) & (
+                    chunk["itemid"].isin(f_ids)
+                )
+                if mask.any():
+                    chunk.loc[mask, "valuenum"] = (
+                        chunk.loc[mask, "valuenum"] - 32.0
+                    ) * (5.0 / 9.0)
+
+            # Percent → fraction (e.g. FiO2: values > 1 are /100)
+            if spec.get("normalize_to_fraction"):
+                feat_mask = chunk["feature_name"] == feat_name
+                pct_mask = feat_mask & (chunk["valuenum"] > 1)
+                if pct_mask.any():
+                    chunk.loc[pct_mask, "valuenum"] = (
+                        chunk.loc[pct_mask, "valuenum"] / 100.0
+                    )
+
+            # Inches → centimetres (e.g. height)
+            in_ids = spec.get("inches_itemids")
+            if in_ids:
+                mask = (chunk["feature_name"] == feat_name) & (
+                    chunk["itemid"].isin(in_ids)
+                )
+                if mask.any():
+                    chunk.loc[mask, "valuenum"] = (
+                        chunk.loc[mask, "valuenum"] * 2.54
+                    )
         return chunk
 
     @staticmethod
@@ -624,6 +644,25 @@ class MIMIC3Exporter(DataExporter):
         base = base.merge(infection_df, on=keys, how="left")
         base = base.merge(sepsis_df, on=keys, how="left")
         base = base.merge(comorbidity_df, on=keys, how="left")
+
+        # Derived: BMI from temporal height/weight means
+        h_m = base.get("height_mean", pd.Series(dtype=float))
+        w_m = base.get("weight_mean", pd.Series(dtype=float))
+        h_valid = h_m.notna() & (h_m > 0)
+        w_valid = w_m.notna() & (w_m > 0)
+        base["bmi"] = np.where(
+            h_valid & w_valid,
+            w_m / (h_m / 100.0) ** 2,
+            np.nan,
+        )
+
+        # Derived: urineoutput normalised to mL/kg/h
+        uo = base.get("urineoutput", pd.Series(dtype=float))
+        base["urineoutput_per_kg_per_h"] = np.where(
+            uo.notna() & w_valid & (w_m > 0),
+            uo / w_m / self.time_window_hours,
+            np.nan,
+        )
 
         # Ensure all expected columns exist (in the right order)
         for col in OUTPUT_COLUMNS:

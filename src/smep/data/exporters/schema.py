@@ -55,6 +55,52 @@ CHARTEVENTS_FEATURES: dict[str, dict[str, Any]] = {
         "valid_max": 100,
         "unit": "%",
     },
+    "fio2": {
+        "itemids": [190, 3420, 3422, 223835, 727],
+        "valid_min": 0,
+        "valid_max": 1.0,
+        "unit": "fraction",
+        # Values > 1 are recorded as percentages and need /100
+        "normalize_to_fraction": True,
+    },
+    "gcs_eye": {
+        "itemids": [220739],
+        "valid_min": 1,
+        "valid_max": 4,
+        "unit": "score",
+    },
+    "gcs_verbal": {
+        "itemids": [223900],
+        "valid_min": 1,
+        "valid_max": 5,
+        "unit": "score",
+    },
+    "gcs_motor": {
+        "itemids": [223901],
+        "valid_min": 1,
+        "valid_max": 6,
+        "unit": "score",
+    },
+    "gcs_total": {
+        "itemids": [198],
+        "valid_min": 3,
+        "valid_max": 15,
+        "unit": "score",
+    },
+    "height": {
+        "itemids": [920, 1394, 226707, 226730],
+        "valid_min": 100,
+        "valid_max": 250,
+        "unit": "cm",
+        # CareVue (920) and MetaVision (226730) record inches
+        "inches_itemids": {920, 226730},
+    },
+    "weight": {
+        "itemids": [762, 763, 3580, 3582, 226512, 224639],
+        "valid_min": 20,
+        "valid_max": 300,
+        "unit": "kg",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -145,6 +191,30 @@ LABEVENTS_FEATURES: dict[str, dict[str, Any]] = {
         "valid_max": 200,
         "unit": "K/µL",
     },
+    "pao2": {
+        "itemids": [50821],
+        "valid_min": 10,
+        "valid_max": 600,
+        "unit": "mmHg",
+    },
+    "paco2": {
+        "itemids": [50818],
+        "valid_min": 10,
+        "valid_max": 150,
+        "unit": "mmHg",
+    },
+    "bilirubin": {
+        "itemids": [50885],
+        "valid_min": 0.1,
+        "valid_max": 60,
+        "unit": "mg/dL",
+    },
+    "pt": {
+        "itemids": [51274],
+        "valid_min": 5,
+        "valid_max": 150,
+        "unit": "seconds",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -162,8 +232,16 @@ TREATMENT_COLUMNS: list[str] = [
     "vent",
     "rrt",
     "urineoutput",
+    "urineoutput_per_kg_per_h",
     "colloid_bolus",
     "crystalloid_bolus",
+]
+
+# ---------------------------------------------------------------------------
+# Derived body-composition columns
+# ---------------------------------------------------------------------------
+BODY_COLUMNS: list[str] = [
+    "bmi",
 ]
 
 # ---------------------------------------------------------------------------
@@ -234,6 +312,8 @@ OUTPUT_COLUMNS: list[str] = [
     # Length of stay
     "icu_los",
     "hosp_los",
+    # Body composition
+    "bmi",
     # Severity scores
     "sofa",
     "lods",
@@ -245,6 +325,7 @@ OUTPUT_COLUMNS: list[str] = [
     "vent",
     "rrt",
     "urineoutput",
+    "urineoutput_per_kg_per_h",
     "colloid_bolus",
     "crystalloid_bolus",
     # Infection timeline
@@ -342,6 +423,16 @@ def build_schema_dict(schema_version: str) -> dict[str, Any]:
             "float",
             "mL",
             "Total urine output within window",
+        ),
+        "urineoutput_per_kg_per_h": (
+            "float",
+            "mL/kg/h",
+            "Urine output normalized by body weight and time",
+        ),
+        "bmi": (
+            "float",
+            "kg/m²",
+            "Body mass index (weight_mean / (height_mean/100)²)",
         ),
         "colloid_bolus": (
             "float",

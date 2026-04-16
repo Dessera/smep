@@ -31,27 +31,6 @@ logger = logging.getLogger(__name__)
 # MIMIC-III item-ID constants
 # ======================================================================
 
-# --- GCS (chartevents) ------------------------------------------------
-_GCS_TOTAL_IDS = [198]  # CareVue total
-_GCS_EYE_IDS = [220739]  # MetaVision component
-_GCS_VERBAL_IDS = [223900]
-_GCS_MOTOR_IDS = [223901]
-
-# --- FiO2 (chartevents) -----------------------------------------------
-_FIO2_IDS = [190, 3420, 3422, 223835, 727]
-
-# --- PaO2 (labevents) -------------------------------------------------
-_PAO2_IDS = [50821]
-
-# --- PaCO2 (labevents) ------------------------------------------------
-_PACO2_IDS = [50818]
-
-# --- Bilirubin total (labevents) --------------------------------------
-_BILIRUBIN_IDS = [50885]
-
-# --- PT / INR (labevents) – used by LODS hepatic ----------------------
-_PT_IDS = [51274]
-
 # --- Vasopressor infusions (inputevents) ------------------------------
 _DOPAMINE_IDS = [30043, 30307, 221662]
 _DOBUTAMINE_IDS = [30042, 30306, 221653]
@@ -79,7 +58,13 @@ _VENT_PROC_IDS = [225792, 225794, 224385]
 
 # --- RRT detection -----------------------------------------------------
 _RRT_PROC_IDS = [
-    225436, 225441, 225802, 225803, 225805, 225809, 225955,
+    225436,
+    225441,
+    225802,
+    225803,
+    225805,
+    225809,
+    225955,
 ]
 _RRT_CHART_IDS = [152]  # "Dialysis Type" in CareVue
 _RRT_OUTPUT_IDS = [40386, 40425, 40507, 40624, 40690, 41500, 41527]
@@ -87,32 +72,97 @@ _RRT_OUTPUT_IDS = [40386, 40425, 40507, 40624, 40690, 41500, 41527]
 # --- Urine output (outputevents) – common items -----------------------
 _URINE_OUTPUT_IDS = [
     # CareVue
-    40055, 40056, 40057, 40061, 40065, 40069, 40085, 40094, 40096,
-    40288, 40405, 40428, 40473, 40651, 40715,
-    43175, 43373, 43431, 43462, 43519, 43522, 43537,
-    43576, 43589, 43633, 43811, 43812, 43856,
-    43966, 43987, 44051, 44080, 44103, 44132, 44237, 44313,
-    44706, 44911, 44925, 45304, 45415,
+    40055,
+    40056,
+    40057,
+    40061,
+    40065,
+    40069,
+    40085,
+    40094,
+    40096,
+    40288,
+    40405,
+    40428,
+    40473,
+    40651,
+    40715,
+    43175,
+    43373,
+    43431,
+    43462,
+    43519,
+    43522,
+    43537,
+    43576,
+    43589,
+    43633,
+    43811,
+    43812,
+    43856,
+    43966,
+    43987,
+    44051,
+    44080,
+    44103,
+    44132,
+    44237,
+    44313,
+    44706,
+    44911,
+    44925,
+    45304,
+    45415,
     # MetaVision
-    226559, 226560, 226561, 226563, 226564, 226565,
-    226566, 226584, 226627, 226631, 227489,
+    226559,
+    226560,
+    226561,
+    226563,
+    226564,
+    226565,
+    226566,
+    226584,
+    226627,
+    226631,
+    227489,
 ]
 
 # --- Colloid bolus (inputevents) --------------------------------------
 _COLLOID_IDS = [
     # CareVue
-    30008, 30009, 30181, 30102, 30107,
+    30008,
+    30009,
+    30181,
+    30102,
+    30107,
     # MetaVision
-    225174, 225795, 226365, 226376,
+    225174,
+    225795,
+    226365,
+    226376,
 ]
 
 # --- Crystalloid bolus (inputevents) ----------------------------------
 _CRYSTALLOID_IDS = [
     # CareVue
-    30018, 30020, 30021, 30143, 30160, 30352, 30353,
+    30018,
+    30020,
+    30021,
+    30143,
+    30160,
+    30352,
+    30353,
     # MetaVision
-    220954, 220955, 225158, 225159, 225161,
-    225823, 225825, 225827, 225828, 225944,
+    220954,
+    220955,
+    225158,
+    225159,
+    225161,
+    225823,
+    225825,
+    225827,
+    225828,
+    225944,
 ]
 
 _CHUNK_SIZE = 100_000
@@ -136,24 +186,15 @@ def compute_scores_and_treatments(
     with columns: sofa, sirs, qsofa, lods, vent, rrt, urineoutput,
     colloid_bolus, crystalloid_bolus.
 
-    *temporal_df* (optional) supplies already-computed temporal
-    aggregates (heartrate_max, tempc_min, etc.) so they don't need
-    to be re-read from CHARTEVENTS / LABEVENTS.
+    *temporal_df* supplies already-computed temporal aggregates
+    (heartrate_max, tempc_min, pao2_min, fio2_max, gcs_total_min, etc.)
+    from the Step 3 extraction pipeline.  GCS, FiO2, PaO2, PaCO2,
+    bilirubin, and PT are now expected to come from *temporal_df*
+    instead of being re-read from raw CSV files.
     """
     keys = ["subject_id", "hadm_id", "icustay_id"]
     result = cohort_df[keys].copy()
     window_td = pd.Timedelta(hours=time_window_hours)
-
-    # --- Gather raw measurements needed by multiple scores ---
-    logger.info("  Gathering GCS, FiO2 from CHARTEVENTS …")
-    chart_raw = _gather_chart_raw(
-        source_path, cohort_df, window_td, read_csv_chunks_fn
-    )
-
-    logger.info("  Gathering PaO2, PaCO2, bilirubin, PT from LABEVENTS …")
-    lab_raw = _gather_lab_raw(
-        source_path, cohort_df, window_td, read_csv_chunks_fn
-    )
 
     logger.info("  Gathering vasopressors from INPUTEVENTS …")
     vaso_flags = _gather_vasopressor_flags(
@@ -167,7 +208,9 @@ def compute_scores_and_treatments(
 
     # --- Pre-aggregate per-stay extremes ---
     stay_data = _build_stay_data(
-        cohort_df, chart_raw, lab_raw, vaso_flags, urine_df,
+        cohort_df,
+        vaso_flags,
+        urine_df,
         temporal_df=temporal_df,
     )
 
@@ -201,9 +244,7 @@ def compute_scores_and_treatments(
     result["vent"] = result["vent"].fillna(0).astype(int)
 
     logger.info("  Detecting RRT …")
-    rrt_df = _detect_rrt(
-        source_path, cohort_df, window_td, read_csv_chunks_fn
-    )
+    rrt_df = _detect_rrt(source_path, cohort_df, window_td, read_csv_chunks_fn)
     result = result.merge(rrt_df, on=keys, how="left")
     result["rrt"] = result["rrt"].fillna(0).astype(int)
 
@@ -242,131 +283,6 @@ def compute_scores_and_treatments(
 # ======================================================================
 
 
-def _gather_chart_raw(
-    source_path: Path,
-    cohort_df: pd.DataFrame,
-    window_td: pd.Timedelta,
-    read_csv_chunks_fn: Any,
-) -> pd.DataFrame:
-    """Gather GCS and FiO2 from CHARTEVENTS."""
-    target_ids: set[int] = {
-        *_GCS_TOTAL_IDS,
-        *_GCS_EYE_IDS,
-        *_GCS_VERBAL_IDS,
-        *_GCS_MOTOR_IDS,
-        *_FIO2_IDS,
-    }
-    accum: list[pd.DataFrame] = []
-    cohort_cols = [
-        "subject_id", "hadm_id", "icustay_id", "intime",
-    ]
-    try:
-        for chunk in read_csv_chunks_fn(
-            source_path / "CHARTEVENTS.csv",
-            required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "charttime", "itemid", "valuenum",
-            ],
-        ):
-            chunk["charttime"] = pd.to_datetime(
-                chunk["charttime"], errors="coerce"
-            )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
-            chunk["valuenum"] = pd.to_numeric(
-                chunk["valuenum"], errors="coerce"
-            )
-            chunk = chunk[chunk["itemid"].isin(target_ids)]
-            if chunk.empty:
-                continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols],
-                on=["subject_id", "hadm_id", "icustay_id"],
-                how="inner",
-            )
-            if chunk.empty:
-                continue
-            chunk = chunk[
-                chunk["valuenum"].notna()
-                & (chunk["charttime"] >= chunk["intime"])
-                & (chunk["charttime"] <= chunk["intime"] + window_td)
-            ].copy()
-            if not chunk.empty:
-                accum.append(
-                    chunk[
-                        [
-                            "subject_id", "hadm_id", "icustay_id",
-                            "charttime", "itemid", "valuenum",
-                        ]
-                    ]
-                )
-    except FileNotFoundError:
-        logger.warning("CHARTEVENTS not found – skipping chart raw")
-    return pd.concat(accum, ignore_index=True) if accum else pd.DataFrame()
-
-
-def _gather_lab_raw(
-    source_path: Path,
-    cohort_df: pd.DataFrame,
-    window_td: pd.Timedelta,
-    read_csv_chunks_fn: Any,
-) -> pd.DataFrame:
-    """Gather PaO2, PaCO2, bilirubin, PT from LABEVENTS."""
-    target_ids: set[int] = {
-        *_PAO2_IDS, *_PACO2_IDS, *_BILIRUBIN_IDS, *_PT_IDS,
-    }
-    accum: list[pd.DataFrame] = []
-    cohort_cols = [
-        "subject_id", "hadm_id", "icustay_id", "intime",
-    ]
-    try:
-        for chunk in read_csv_chunks_fn(
-            source_path / "LABEVENTS.csv",
-            required=[
-                "subject_id", "hadm_id", "charttime",
-                "itemid", "valuenum",
-            ],
-        ):
-            chunk["charttime"] = pd.to_datetime(
-                chunk["charttime"], errors="coerce"
-            )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
-            chunk["valuenum"] = pd.to_numeric(
-                chunk["valuenum"], errors="coerce"
-            )
-            chunk = chunk[chunk["itemid"].isin(target_ids)]
-            if chunk.empty:
-                continue
-            # LABEVENTS has no icustay_id → merge via subject+hadm
-            chunk = chunk.merge(
-                cohort_df[cohort_cols],
-                on=["subject_id", "hadm_id"],
-                how="inner",
-            )
-            if chunk.empty:
-                continue
-            chunk = chunk[
-                chunk["valuenum"].notna()
-                & (chunk["charttime"] >= chunk["intime"])
-                & (chunk["charttime"] <= chunk["intime"] + window_td)
-            ].copy()
-            if not chunk.empty:
-                accum.append(
-                    chunk[
-                        [
-                            "subject_id", "hadm_id", "icustay_id",
-                            "charttime", "itemid", "valuenum",
-                        ]
-                    ]
-                )
-    except FileNotFoundError:
-        logger.warning("LABEVENTS not found – skipping lab raw")
-    return pd.concat(accum, ignore_index=True) if accum else pd.DataFrame()
-
-
 def _gather_vasopressor_flags(
     source_path: Path,
     cohort_df: pd.DataFrame,
@@ -391,8 +307,13 @@ def _gather_vasopressor_flags(
         try:
             for chunk in read_csv_chunks_fn(
                 source_path / csv_name,
-                required=["subject_id", "hadm_id", "icustay_id",
-                           time_col, "itemid"],
+                required=[
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    time_col,
+                    "itemid",
+                ],
             ):
                 chunk["_time"] = pd.to_datetime(
                     chunk[time_col], errors="coerce"
@@ -400,9 +321,7 @@ def _gather_vasopressor_flags(
                 chunk["itemid"] = pd.to_numeric(
                     chunk["itemid"], errors="coerce"
                 )
-                chunk = chunk[
-                    chunk["itemid"].isin(_ALL_VASOPRESSOR_IDS)
-                ]
+                chunk = chunk[chunk["itemid"].isin(_ALL_VASOPRESSOR_IDS)]
                 if chunk.empty:
                     continue
                 chunk = chunk.merge(
@@ -431,9 +350,13 @@ def _gather_vasopressor_flags(
         ]:
             flagged = events[events["itemid"].isin(ids)][keys].drop_duplicates()
             flagged[col] = 1
-            result = result.merge(flagged, on=keys, how="left", suffixes=("", "_r"))
+            result = result.merge(
+                flagged, on=keys, how="left", suffixes=("", "_r")
+            )
             if f"{col}_r" in result.columns:
-                result[col] = result[col].fillna(result[f"{col}_r"]).fillna(0).astype(int)
+                result[col] = (
+                    result[col].fillna(result[f"{col}_r"]).fillna(0).astype(int)
+                )
                 result = result.drop(columns=[f"{col}_r"])
             else:
                 result[col] = result[col].fillna(0).astype(int)
@@ -456,25 +379,23 @@ def _gather_urine_output(
         for chunk in read_csv_chunks_fn(
             source_path / "OUTPUTEVENTS.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "charttime", "itemid", "value",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "charttime",
+                "itemid",
+                "value",
             ],
         ):
             chunk["charttime"] = pd.to_datetime(
                 chunk["charttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
-            chunk["value"] = pd.to_numeric(
-                chunk["value"], errors="coerce"
-            )
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
+            chunk["value"] = pd.to_numeric(chunk["value"], errors="coerce")
             chunk = chunk[chunk["itemid"].isin(_URINE_OUTPUT_IDS)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
@@ -516,34 +437,29 @@ def _detect_ventilation(
         for chunk in read_csv_chunks_fn(
             source_path / "CHARTEVENTS.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "charttime", "itemid",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "charttime",
+                "itemid",
             ],
         ):
             chunk["charttime"] = pd.to_datetime(
                 chunk["charttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
             chunk = chunk[chunk["itemid"].isin(chart_ids)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
                 (chunk["charttime"] >= chunk["intime"])
                 & (chunk["charttime"] <= chunk["intime"] + window_td)
             ]
-            for row in chunk[keys].drop_duplicates().itertuples(
-                index=False
-            ):
-                vent_stays.add(
-                    (row.subject_id, row.hadm_id, row.icustay_id)
-                )
+            for row in chunk[keys].drop_duplicates().itertuples(index=False):
+                vent_stays.add((row.subject_id, row.hadm_id, row.icustay_id))
     except FileNotFoundError:
         pass
 
@@ -552,45 +468,36 @@ def _detect_ventilation(
         for chunk in read_csv_chunks_fn(
             source_path / "PROCEDUREEVENTS_MV.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "starttime", "itemid",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "starttime",
+                "itemid",
             ],
         ):
             chunk["starttime"] = pd.to_datetime(
                 chunk["starttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
-            chunk = chunk[
-                chunk["itemid"].isin(_VENT_PROC_IDS)
-            ]
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
+            chunk = chunk[chunk["itemid"].isin(_VENT_PROC_IDS)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
                 (chunk["starttime"] >= chunk["intime"])
-                & (chunk["starttime"]
-                   <= chunk["intime"] + window_td)
+                & (chunk["starttime"] <= chunk["intime"] + window_td)
             ]
-            for row in chunk[keys].drop_duplicates().itertuples(
-                index=False
-            ):
-                vent_stays.add(
-                    (row.subject_id, row.hadm_id, row.icustay_id)
-                )
+            for row in chunk[keys].drop_duplicates().itertuples(index=False):
+                vent_stays.add((row.subject_id, row.hadm_id, row.icustay_id))
     except FileNotFoundError:
         pass
 
     result = cohort_df[keys].copy()
     result["vent"] = result.apply(
         lambda r: int(
-            (r["subject_id"], r["hadm_id"], r["icustay_id"])
-            in vent_stays
+            (r["subject_id"], r["hadm_id"], r["icustay_id"]) in vent_stays
         ),
         axis=1,
     )
@@ -613,35 +520,29 @@ def _detect_rrt(
         for chunk in read_csv_chunks_fn(
             source_path / "PROCEDUREEVENTS_MV.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "starttime", "itemid",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "starttime",
+                "itemid",
             ],
         ):
             chunk["starttime"] = pd.to_datetime(
                 chunk["starttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
             chunk = chunk[chunk["itemid"].isin(_RRT_PROC_IDS)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
                 (chunk["starttime"] >= chunk["intime"])
-                & (chunk["starttime"]
-                   <= chunk["intime"] + window_td)
+                & (chunk["starttime"] <= chunk["intime"] + window_td)
             ]
-            for row in chunk[keys].drop_duplicates().itertuples(
-                index=False
-            ):
-                rrt_stays.add(
-                    (row.subject_id, row.hadm_id, row.icustay_id)
-                )
+            for row in chunk[keys].drop_duplicates().itertuples(index=False):
+                rrt_stays.add((row.subject_id, row.hadm_id, row.icustay_id))
     except FileNotFoundError:
         pass
 
@@ -650,35 +551,29 @@ def _detect_rrt(
         for chunk in read_csv_chunks_fn(
             source_path / "CHARTEVENTS.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "charttime", "itemid",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "charttime",
+                "itemid",
             ],
         ):
             chunk["charttime"] = pd.to_datetime(
                 chunk["charttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
             chunk = chunk[chunk["itemid"].isin(_RRT_CHART_IDS)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
                 (chunk["charttime"] >= chunk["intime"])
-                & (chunk["charttime"]
-                   <= chunk["intime"] + window_td)
+                & (chunk["charttime"] <= chunk["intime"] + window_td)
             ]
-            for row in chunk[keys].drop_duplicates().itertuples(
-                index=False
-            ):
-                rrt_stays.add(
-                    (row.subject_id, row.hadm_id, row.icustay_id)
-                )
+            for row in chunk[keys].drop_duplicates().itertuples(index=False):
+                rrt_stays.add((row.subject_id, row.hadm_id, row.icustay_id))
     except FileNotFoundError:
         pass
 
@@ -687,43 +582,36 @@ def _detect_rrt(
         for chunk in read_csv_chunks_fn(
             source_path / "OUTPUTEVENTS.csv",
             required=[
-                "subject_id", "hadm_id", "icustay_id",
-                "charttime", "itemid",
+                "subject_id",
+                "hadm_id",
+                "icustay_id",
+                "charttime",
+                "itemid",
             ],
         ):
             chunk["charttime"] = pd.to_datetime(
                 chunk["charttime"], errors="coerce"
             )
-            chunk["itemid"] = pd.to_numeric(
-                chunk["itemid"], errors="coerce"
-            )
+            chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
             chunk = chunk[chunk["itemid"].isin(_RRT_OUTPUT_IDS)]
             if chunk.empty:
                 continue
-            chunk = chunk.merge(
-                cohort_df[cohort_cols], on=keys, how="inner"
-            )
+            chunk = chunk.merge(cohort_df[cohort_cols], on=keys, how="inner")
             if chunk.empty:
                 continue
             chunk = chunk[
                 (chunk["charttime"] >= chunk["intime"])
-                & (chunk["charttime"]
-                   <= chunk["intime"] + window_td)
+                & (chunk["charttime"] <= chunk["intime"] + window_td)
             ]
-            for row in chunk[keys].drop_duplicates().itertuples(
-                index=False
-            ):
-                rrt_stays.add(
-                    (row.subject_id, row.hadm_id, row.icustay_id)
-                )
+            for row in chunk[keys].drop_duplicates().itertuples(index=False):
+                rrt_stays.add((row.subject_id, row.hadm_id, row.icustay_id))
     except FileNotFoundError:
         pass
 
     result = cohort_df[keys].copy()
     result["rrt"] = result.apply(
         lambda r: int(
-            (r["subject_id"], r["hadm_id"], r["icustay_id"])
-            in rrt_stays
+            (r["subject_id"], r["hadm_id"], r["icustay_id"]) in rrt_stays
         ),
         axis=1,
     )
@@ -750,8 +638,12 @@ def _gather_fluid_bolus(
             for chunk in read_csv_chunks_fn(
                 source_path / csv_name,
                 required=[
-                    "subject_id", "hadm_id", "icustay_id",
-                    time_col, "itemid", "amount",
+                    "subject_id",
+                    "hadm_id",
+                    "icustay_id",
+                    time_col,
+                    "itemid",
+                    "amount",
                 ],
             ):
                 chunk["_time"] = pd.to_datetime(
@@ -775,8 +667,7 @@ def _gather_fluid_bolus(
                     chunk["amount"].notna()
                     & (chunk["amount"] > 0)
                     & (chunk["_time"] >= chunk["intime"])
-                    & (chunk["_time"]
-                       <= chunk["intime"] + window_td)
+                    & (chunk["_time"] <= chunk["intime"] + window_td)
                 ].copy()
                 if not chunk.empty:
                     accum.append(chunk[keys + ["itemid", "amount"]])
@@ -822,8 +713,6 @@ def _gather_fluid_bolus(
 
 def _build_stay_data(
     cohort_df: pd.DataFrame,
-    chart_raw: pd.DataFrame,
-    lab_raw: pd.DataFrame,
     vaso_flags: pd.DataFrame,
     urine_df: pd.DataFrame,
     *,
@@ -835,11 +724,36 @@ def _build_stay_data(
     paco2_min, bilirubin_max, pt_max, dopamine, dobutamine,
     norepinephrine, epinephrine, urineoutput, ...}
 
-    If *temporal_df* is provided, it injects already-computed
-    temporal aggregates (e.g. heartrate_max, platelet_min) so scores
-    can use them without re-reading events tables.
+    All clinical values (GCS, FiO2, PaO2, PaCO2, bilirubin, PT,
+    vitals, labs) are sourced from *temporal_df* columns produced
+    by the Step 3 extraction pipeline.
     """
     data: dict[int, dict[str, Any]] = {}
+
+    # All keys that scores need from temporal_df
+    _TEMPORAL_KEYS = [
+        "heartrate_max",
+        "tempc_min",
+        "tempc_max",
+        "resprate_max",
+        "sysbp_min",
+        "wbc_min",
+        "wbc_max",
+        "platelet_min",
+        "creatinine_max",
+        "meanbp_min",
+        "bun_max",
+        # Newly moved from chart/lab raw extraction:
+        "pao2_min",
+        "paco2_min",
+        "bilirubin_max",
+        "pt_max",
+        "fio2_max",
+        "gcs_total_min",
+        "gcs_eye_min",
+        "gcs_verbal_min",
+        "gcs_motor_min",
+    ]
 
     # Initialize from cohort
     for _, row in cohort_df.iterrows():
@@ -856,7 +770,6 @@ def _build_stay_data(
             "norepinephrine": 0,
             "epinephrine": 0,
             "urineoutput": np.nan,
-            # These come from schema's temporal extraction:
             "heartrate_max": np.nan,
             "tempc_min": np.nan,
             "tempc_max": np.nan,
@@ -870,88 +783,15 @@ def _build_stay_data(
             "bun_max": np.nan,
         }
 
-    # GCS from chartevents
-    if not chart_raw.empty:
-        gcs_total_ids = set(_GCS_TOTAL_IDS)
-        gcs_eye_ids = set(_GCS_EYE_IDS)
-        gcs_verbal_ids = set(_GCS_VERBAL_IDS)
-        gcs_motor_ids = set(_GCS_MOTOR_IDS)
-        fio2_ids = set(_FIO2_IDS)
-
-        for icustay_id, grp in chart_raw.groupby("icustay_id"):
-            icustay_id = int(icustay_id)
-            if icustay_id not in data:
-                continue
-            d = data[icustay_id]
-
-            # GCS total (CareVue)
-            gcs_tot = grp[grp["itemid"].isin(gcs_total_ids)]["valuenum"]
-            # GCS components (MetaVision) – sum per charttime
-            eye = grp[grp["itemid"].isin(gcs_eye_ids)]
-            verbal = grp[grp["itemid"].isin(gcs_verbal_ids)]
-            motor = grp[grp["itemid"].isin(gcs_motor_ids)]
-
-            gcs_values = list(gcs_tot.values)
-
-            if not eye.empty and not verbal.empty and not motor.empty:
-                # simple approach: worst eye + worst verbal + worst motor
-                gcs_mv = (
-                    eye["valuenum"].min()
-                    + verbal["valuenum"].min()
-                    + motor["valuenum"].min()
-                )
-                gcs_values.append(gcs_mv)
-
-            if gcs_values:
-                d["gcs_min"] = float(min(gcs_values))
-
-            # FiO2
-            fio2_vals = grp[grp["itemid"].isin(fio2_ids)]["valuenum"]
-            if not fio2_vals.empty:
-                # FiO2 could be 0-1 or 0-100; normalize to fraction
-                fio2_vals = fio2_vals.copy()
-                fio2_vals = fio2_vals.where(fio2_vals > 0)
-                fio2_vals.loc[fio2_vals > 1] = (
-                    fio2_vals[fio2_vals > 1] / 100.0
-                )
-                d["fio2_max"] = float(fio2_vals.max())
-
-    # Lab values
-    if not lab_raw.empty:
-        pao2_ids = set(_PAO2_IDS)
-        paco2_ids = set(_PACO2_IDS)
-        bili_ids = set(_BILIRUBIN_IDS)
-        pt_ids = set(_PT_IDS)
-
-        for icustay_id, grp in lab_raw.groupby("icustay_id"):
-            icustay_id = int(icustay_id)
-            if icustay_id not in data:
-                continue
-            d = data[icustay_id]
-
-            pao2 = grp[grp["itemid"].isin(pao2_ids)]["valuenum"]
-            if not pao2.empty:
-                d["pao2_min"] = float(pao2.min())
-
-            paco2 = grp[grp["itemid"].isin(paco2_ids)]["valuenum"]
-            if not paco2.empty:
-                d["paco2_min"] = float(paco2.min())
-
-            bili = grp[grp["itemid"].isin(bili_ids)]["valuenum"]
-            if not bili.empty:
-                d["bilirubin_max"] = float(bili.max())
-
-            pt = grp[grp["itemid"].isin(pt_ids)]["valuenum"]
-            if not pt.empty:
-                d["pt_max"] = float(pt.max())
-
     # Vasopressor flags
     for _, row in vaso_flags.iterrows():
         icustay_id = int(row["icustay_id"])
         if icustay_id in data:
             for col in (
-                "dopamine", "dobutamine",
-                "norepinephrine", "epinephrine",
+                "dopamine",
+                "dobutamine",
+                "norepinephrine",
+                "epinephrine",
             ):
                 data[icustay_id][col] = int(row[col])
 
@@ -962,14 +802,7 @@ def _build_stay_data(
             if icustay_id in data:
                 data[icustay_id]["urineoutput"] = float(row["total_ml"])
 
-    # Inject temporal aggregates (already computed in step 3)
-    _TEMPORAL_KEYS = [
-        "heartrate_max", "tempc_min", "tempc_max",
-        "resprate_max", "sysbp_min",
-        "wbc_min", "wbc_max",
-        "platelet_min", "creatinine_max",
-        "meanbp_min", "bun_max",
-    ]
+    # Inject temporal aggregates (all clinical values from step 3)
     if temporal_df is not None:
         avail = [c for c in _TEMPORAL_KEYS if c in temporal_df.columns]
         if avail:
@@ -981,6 +814,34 @@ def _build_stay_data(
                     val = row[col]
                     if val is not None and not np.isnan(val):
                         data[icustay_id][col] = float(val)
+
+        # Derive composite GCS minimum from temporal columns
+        # GCS is recorded two ways in MIMIC-III:
+        #   CareVue: gcs_total (itemid 198) – a single total score
+        #   MetaVision: gcs_eye + gcs_verbal + gcs_motor – components
+        # Take the minimum of both approaches.
+        for icustay_id, d in data.items():
+            gcs_candidates: list[float] = []
+
+            gcs_total = d.get("gcs_total_min")
+            if gcs_total is not None and not np.isnan(gcs_total):
+                gcs_candidates.append(gcs_total)
+
+            gcs_e = d.get("gcs_eye_min")
+            gcs_v = d.get("gcs_verbal_min")
+            gcs_m = d.get("gcs_motor_min")
+            if (
+                gcs_e is not None
+                and not np.isnan(gcs_e)
+                and gcs_v is not None
+                and not np.isnan(gcs_v)
+                and gcs_m is not None
+                and not np.isnan(gcs_m)
+            ):
+                gcs_candidates.append(gcs_e + gcs_v + gcs_m)
+
+            if gcs_candidates:
+                d["gcs_min"] = min(gcs_candidates)
 
     return data
 
@@ -1136,9 +997,7 @@ def _sirs(data: dict[int, dict[str, Any]], icustay_id: int) -> int:
     # 3. Respiratory rate or PaCO2
     rr_max = d.get("resprate_max")
     paco2 = d.get("paco2_min")
-    if (
-        rr_max is not None and not np.isnan(rr_max) and rr_max > 20
-    ) or (
+    if (rr_max is not None and not np.isnan(rr_max) and rr_max > 20) or (
         paco2 is not None and not np.isnan(paco2) and paco2 < 32
     ):
         score += 1
@@ -1146,9 +1005,7 @@ def _sirs(data: dict[int, dict[str, Any]], icustay_id: int) -> int:
     # 4. WBC
     wbc_min = d.get("wbc_min")
     wbc_max = d.get("wbc_max")
-    if (
-        wbc_min is not None and not np.isnan(wbc_min) and wbc_min < 4
-    ) or (
+    if (wbc_min is not None and not np.isnan(wbc_min) and wbc_min < 4) or (
         wbc_max is not None and not np.isnan(wbc_max) and wbc_max > 12
     ):
         score += 1

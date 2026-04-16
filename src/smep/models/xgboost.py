@@ -74,19 +74,14 @@ class XGBoostModel(Model):
         use_early_stopping = X_val is not None and y_val is not None
 
         base_classifier = XGBClassifier(
-            n_estimators=1000 if use_early_stopping else 200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=3,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
+            n_estimators=100,
+            max_depth=20,
+            learning_rate=0.1,
+            subsample=0.5,
+            min_child_weight=0.1,
+            gamma=0.0,
             scale_pos_weight=float(scale_pos_weight),
-            use_label_encoder=False,
             eval_metric="logloss",
-            early_stopping_rounds=50 if use_early_stopping else None,
             random_state=42,
             n_jobs=-1,
         )
